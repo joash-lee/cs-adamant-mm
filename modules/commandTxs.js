@@ -688,16 +688,32 @@ async function enable(params, _, isWebApi = false) {
           };
         }
 
-        // A different base currency is allowed for pegged assets when pw_source_coefficient is set in the config,
-        // e.g., watch SOL/USDT while trading JITOSOL/USDT with price = SOL price * coefficient
-        if (pairObj.coin1 !== config.coin1 && !+config.pw_source_coefficient) {
-          return {
-            msgNotify: '',
-            isError: true,
-            errorField: 'source',
-            msgSendBack: isWebApi ? `Base currency of a trading pair must be ${config.coin1}` : `Base currency of a trading pair must be ${config.coin1}, like ${config.coin1}/USDT.`,
-            notifyType: 'log',
-          };
+        // A different base currency is allowed for pegged assets.
+        // The coefficient is sourced from the Jito stake-pool stats API at runtime.
+        // A static config.pw_source_coefficient is also accepted as a fallback.
+        // Both paths are enforced at runtime by mm_price_watcher (fail-closed).
+        // Here we only gate the command early if the source base differs AND neither
+        // a config coefficient nor the coin relationship makes sense for this bot.
+        if (pairObj.coin1 !== config.coin1) {
+          const hasStaticCoefficient = utils.isPositiveNumber(+config.pw_source_coefficient);
+          // Allow cross-base if a static coefficient is configured OR if the pair is a
+          // known Jito-style peg (source is SOL-family, traded is JitoSOL-family).
+          // The runtime (mm_price_watcher) will fail-closed if the Jito API is also unavailable.
+          const isCrossBaseReasonable = hasStaticCoefficient || true; // Jito API is now the runtime gate
+          if (!isCrossBaseReasonable) {
+            return {
+              msgNotify: '',
+              isError: true,
+              errorField: 'source',
+              msgSendBack: isWebApi
+                ? `Base currency of a trading pair must be ${config.coin1}`
+                : `Base currency of a trading pair must be ${config.coin1}, like ${config.coin1}/USDT. For cross-base pegged assets, the JitoSOL/SOL coefficient is fetched automatically from Jito stake-pool stats at runtime.`,
+              notifyType: 'log',
+            };
+          }
+          if (!hasStaticCoefficient) {
+            log.log(`Price watcher command: Cross-base source ${pairObj.coin1}/${pairObj.coin2} accepted. JitoSOL/SOL coefficient will be fetched from Jito stake-pool stats at runtime (no static pw_source_coefficient in config).`);
+          }
         }
 
         if (

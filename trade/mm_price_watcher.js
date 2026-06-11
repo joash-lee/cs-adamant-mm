@@ -51,6 +51,7 @@
 const constants = require('../helpers/const');
 const utils = require('../helpers/utils');
 const exchangerUtils = require('../helpers/cryptos/exchanger');
+const jitoCoefficient = require('../helpers/cryptos/jitoCoefficient');
 const config = require('../modules/configReader');
 const log = require('../helpers/log');
 const notify = require('../helpers/notify');
@@ -941,14 +942,48 @@ async function setPriceRange() {
         isPriceAnomaly = false;
       }
 
-      // Apply a fixed price coefficient for pegged assets, e.g., JITOSOL = SOL * exchange rate.
-      // Allows watching a source pair with a different base currency, as SOL/USDT@Coinstore while trading JITOSOL/USDT.
-      const pwSourceCoefficient = +config.pw_source_coefficient || 1;
-      if (pwSourceCoefficient !== 1) {
-        l = l * pwSourceCoefficient;
-        h = h * pwSourceCoefficient;
-        log.log(`Price watcher: Applied the pw_source_coefficient of ${pwSourceCoefficient}: the range is from ${l.toFixed(coin2Decimals)} to ${h.toFixed(coin2Decimals)} ${config.coin2} now.`);
+      // Apply a price coefficient for pegged assets, e.g. JITOSOL = SOL * exchange_rate.
+      // Cross-base sources (source coin1 ≠ traded coin1) MUST have a valid coefficient.
+      // Fail closed if no coefficient is available — never silently default to 1.
+      const targetCoin1 = targetPairObj.coin1;
+      const isCrossBase = targetCoin1 !== config.coin1;
+
+      if (isCrossBase) {
+        // Try the live Jito stake-pool coefficient (primary source).
+        const coefResult = await jitoCoefficient.getCoefficient();
+        let coef = coefResult.coefficient;
+        let coefDescription = coefResult.description;
+
+        if (coef === null) {
+          // Live source unavailable; try the static config fallback.
+          const configCoef = +config.pw_source_coefficient;
+          if (utils.isPositiveNumber(configCoef)) {
+            coef = configCoef;
+            coefDescription = `Jito API unavailable (${coefResult.description}), using static config pw_source_coefficient=${coef}`;
+            log.warn(`Price watcher: ${coefDescription}`);
+          }
+        }
+
+        if (coef === null) {
+          // Both sources exhausted — fail closed.
+          errorSettingPriceRange(
+              `Cross-base PW source ${targetPair}@${targetExchange}→${config.coin1} requires a valid JitoSOL/SOL coefficient. ` +
+              `Jito API: ${coefResult.description}. No valid pw_source_coefficient in config. Not applying coefficient=1.`,
+          );
+          return false;
+        }
+
+        l = l * coef;
+        h = h * coef;
+        log.log(`Price watcher: Applied cross-base coefficient ${coef.toFixed(6)} (${coefResult.status ?? 'config-fallback'}) → range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2}. ${coefDescription}`);
+      } else if (utils.isPositiveNumber(+config.pw_source_coefficient)) {
+        // Same-base source but an explicit coefficient is configured — apply it.
+        const coef = +config.pw_source_coefficient;
+        l = l * coef;
+        h = h * coef;
+        log.log(`Price watcher: Applied config pw_source_coefficient ${coef}: range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2}.`);
       }
+      // Same-base source with no coefficient: coefficient is implicitly 1 (existing behaviour).
 
       // Use allowed price deviation mm_priceWatcherDeviationPercent
       l = l * (1 - tradeParams.mm_priceWatcherDeviationPercent/100);

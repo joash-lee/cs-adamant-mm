@@ -372,6 +372,16 @@ try {
     }
   });
 
+  // pw_source_coefficient must be finite and strictly positive when set.
+  // A value of 0, negative, NaN, or Infinity would anchor a pegged asset at the wrong price.
+  if (config.pw_source_coefficient !== undefined && config.pw_source_coefficient !== null) {
+    const coef = +config.pw_source_coefficient;
+    if (!isFinite(coef) || isNaN(coef) || coef <= 0) {
+      exit(`Bot's config is wrong. pw_source_coefficient must be a finite positive number (got ${config.pw_source_coefficient}). Cannot start Bot.`);
+    }
+    console.info(`Config reader: pw_source_coefficient is set to ${coef} (static fallback for cross-base Price Watcher).`);
+  }
+
   config.fund_supplier.coins.forEach((coin) => {
     coin.coin = coin.coin?.toUpperCase();
     coin.sources.forEach((source) => {
