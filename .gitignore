@@ -21,3 +21,5 @@ trade/settings/*
 !trade/settings/tradeParams_Default.js
 CLAUDE.md
 .ai-tasks/
+.firecrawl/
+tsconfig.json
