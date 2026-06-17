@@ -756,6 +756,21 @@ async function enable(params, _, isWebApi = false) {
           };
         }
 
+        if (exchangeName.toLowerCase() === 'okx') {
+          if (!config.okx_apikey || !config.okx_apisecret || !config.okx_apipassphrase) {
+            return {
+              msgNotify: '',
+              isError: true,
+              errorField: 'source',
+              msgSendBack: 'OKX API credentials (okx_apikey, okx_apisecret, okx_apipassphrase) must be set in config.jsonc before enabling JITOSOL/USDT@OKX Price watcher.',
+              notifyType: 'log',
+            };
+          }
+
+          const okxAuthMode = pairObj.exchangeApi.getLastAuthMode?.();
+          log.log(`Price watcher command: OKX preflight OK for ${pairObj.pair}. Auth mode: ${okxAuthMode || 'unknown'}.`);
+        }
+
         pwSource = `${pairObj.pair}@${exchangeName}`;
 
         // Validate deviation percent
@@ -804,6 +819,9 @@ async function enable(params, _, isWebApi = false) {
         pwMidPrice = 0;
 
         infoString = ` based on _${pwSource}_ with _${pwSourcePolicy}_ policy, _${pwDeviationPercent.toFixed(2)}%_ deviation and _${pwAction}_ action`;
+        if (config.pw_fallback_source && exchangeName.toLowerCase() === 'okx') {
+          infoString += ` (configured fallback: _${config.pw_fallback_source}_)`;
+        }
 
       } else {
         // Watch price in coin

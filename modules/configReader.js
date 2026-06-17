@@ -58,6 +58,26 @@ const fields = {
     type: Number,
     isRequired: false,
   },
+  okx_apikey: {
+    type: String,
+    default: '',
+    isRequired: false,
+  },
+  okx_apisecret: {
+    type: String,
+    default: '',
+    isRequired: false,
+  },
+  okx_apipassphrase: {
+    type: String,
+    default: '',
+    isRequired: false,
+  },
+  pw_fallback_source: {
+    type: String,
+    default: '',
+    isRequired: false,
+  },
   fund_supplier: {
     type: Object,
     default: {
@@ -376,10 +396,42 @@ try {
   // A value of 0, negative, NaN, or Infinity would anchor a pegged asset at the wrong price.
   if (config.pw_source_coefficient !== undefined && config.pw_source_coefficient !== null) {
     const coef = +config.pw_source_coefficient;
-    if (!isFinite(coef) || isNaN(coef) || coef <= 0) {
+    if (coef !== 0 && (!isFinite(coef) || isNaN(coef) || coef <= 0)) {
       exit(`Bot's config is wrong. pw_source_coefficient must be a finite positive number (got ${config.pw_source_coefficient}). Cannot start Bot.`);
     }
-    console.info(`Config reader: pw_source_coefficient is set to ${coef} (static fallback for cross-base Price Watcher).`);
+    if (coef > 0) {
+      console.info(`Config reader: pw_source_coefficient is set to ${coef} (static fallback for cross-base Price Watcher).`);
+    }
+  }
+
+  const hasOkxExchange = config.exchanges.some((e) => e.toLowerCase() === 'okx');
+
+  if (hasOkxExchange) {
+    const okxFields = ['okx_apikey', 'okx_apisecret', 'okx_apipassphrase'];
+    for (const field of okxFields) {
+      if (!config[field] || typeof config[field] !== 'string' || !config[field].trim()) {
+        exit(`Bot's config is wrong. Field _${field}_ is required when OKX is in exchanges. Cannot start Bot.`);
+      }
+    }
+    console.info('Config reader: OKX API credentials loaded for PW source connector.');
+
+    if (!config.pw_fallback_source || typeof config.pw_fallback_source !== 'string' || !config.pw_fallback_source.trim()) {
+      exit('Bot\'s config is wrong. Field _pw_fallback_source_ is required when OKX is in exchanges (format PAIR@Exchange). Cannot start Bot.');
+    }
+
+    const fallbackParts = config.pw_fallback_source.split('@');
+    if (fallbackParts.length !== 2 || !fallbackParts[0].includes('/') || !fallbackParts[1].trim()) {
+      exit(`Bot's config is wrong. pw_fallback_source must match PAIR@Exchange format (got "${config.pw_fallback_source}"). Cannot start Bot.`);
+    }
+
+    const fallbackExchangeLc = fallbackParts[1].trim().toLowerCase();
+    const fallbackExchangeSupported = config.exchanges.some((e) => e.toLowerCase() === fallbackExchangeLc);
+
+    if (!fallbackExchangeSupported) {
+      exit(`Bot's config is wrong. pw_fallback_source exchange "${fallbackParts[1]}" is not in exchanges list. Cannot start Bot.`);
+    }
+
+    console.info(`Config reader: pw_fallback_source is set to ${config.pw_fallback_source}.`);
   }
 
   config.fund_supplier.coins.forEach((coin) => {

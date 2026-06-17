@@ -56,7 +56,8 @@
     "Coinstore",
     "FameEX",
     "NonKYC",
-    "XeggeX"
+    "XeggeX",
+    "OKX"
   ],
 
   /** Exchange to work with. Case insensitive. **/
@@ -105,6 +106,25 @@
 
   /** Exchange's account trade password or memo (if required by exchange) **/
   "apipassword": "YOUR-TRADE-PASS",
+
+  /**
+    OKX API credentials for Price Watcher external source (read-only keys recommended).
+    Required when OKX is listed in exchanges. Bot degrades to keyless public API if keys expire.
+  **/
+  "okx_apikey": "YOUR-OKX-KEY",
+  "okx_apisecret": "YOUR-OKX-SECRET",
+  "okx_apipassphrase": "YOUR-OKX-PASSPHRASE",
+
+  /**
+    Static PW fallback when the primary Pair@Exchange source is unavailable (config-only, not tradeParams).
+    Format: PAIR@Exchange, e.g. SOL/USDT@Coinstore for JITOSOL/USDT@OKX primary setup.
+  **/
+  "pw_fallback_source": "SOL/USDT@Coinstore",
+
+  /**
+    Static JitoSOL/SOL coefficient fallback for cross-base PW sources when Jito API is unavailable.
+  **/
+  "pw_source_coefficient": 0,
 
   /** Override project name for notifications. Letters, digits, - and ~ only. By default, it's derived from a repository name, TradeBot-me. **/
   "project_name": "",

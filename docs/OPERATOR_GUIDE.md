@@ -1,109 +1,155 @@
-# Operator guide — JITOSOL/USDT MM (for `/cs-mm-helper`)
+# Operator guide — how the bot behaves (plain English)
 
-This doc captures **how to think about the live bot**, common operator concerns, and how to interpret `/params`, `/orders`, and `pm2` logs. Use with [RUNBOOK.md](./RUNBOOK.md) and [TROUBLESHOOTING.md](./TROUBLESHOOTING.md).
+**Use this doc** when you want to understand PW, liq, MM, and risk — not copy-paste commands. For commands, open **[RUNBOOK.md](./RUNBOOK.md)**. For deploy/restart, open **[OKX_PW_SETUP.md](./OKX_PW_SETUP.md)**.
 
-Always prefer **fresh** `/params`, `/balances`, `/orders JITOSOL/USDT`, and `pm2 logs tradebot --lines 80` over snapshots below.
-
----
-
-## Operator baseline (2026-06-15 live session)
-
-**Phase:** Opening day — market live, `optimal` MM running.
-
-**Typical `/params` profile (operator-tuned):**
-
-| Setting | Value |
-|---------|--------|
-| `mm_Policy` | `optimal` |
-| `mm_minAmount` / `mm_maxAmount` | `0.5` – `1` JITOSOL |
-| `mm_minInterval` / `mm_maxInterval` | `5` – `30` sec |
-| PW | `SOL/USDT@Coinstore`, **2.5%**, `smart`, **`prevent`** |
-| Liq | **2%**, **12 JITOSOL**, **1200 USDT**, `middle` |
-| OB | **8** orders, **25%** max (high API churn — watch **429**) |
-
-**Wallet ballpark at session:** ~42 JITOSOL, ~5,160 USDT (~$5,157 total). Liq near full deploy (~1,160 USDT bids, ~13.5 JITOSOL asks). **2 manual** orders (~393 USDT buys) and **3 unknown** orders seen once — investigate if still present.
-
-**Price anchor:** SOL/USDT on Coinstore × Jito coef (~**1.2849**) ± PW deviation. **Not** Friday-static; PW updates every few seconds. Fair JITOSOL ~$91.6 when SOL ~$71.35; market mid was ~$90.9 (~1% below peg).
+Always trust **live** `/params`, `/balances`, `/orders JITOSOL/USDT`, and `pm2 logs` over anything written here.
 
 ---
 
-## Module primer (PW, LIQ, OB, MM, MAN)
+## Fair price in one paragraph
 
-### Price Watcher (PW)
+The bot needs to know: *“What should JITOSOL cost in USDT?”*
 
-- **Layman:** Fair-price fence from **SOL**, not JITOSOL book spam.
-- **Technical:** `mm_price_watcher.js` — `SOL/USDT@Coinstore` smart bid/ask × `jitoCoefficient` × (1 ± deviation%). With **`prevent`**: blocks bot from bad prices; **does not** spend balance to defend; **does not** stop strangers from filling your quotes inside the band.
-- **Check:** `/params` (no `/info pw`). Logs: `Applied cross-base coefficient`, `within Pw's range`.
-- **Enable shape:** `/enable pw SOL/USDT@Coinstore 2.5% smart prevent`
+It now asks **OKX** (a big external exchange that lists JITOSOL/USDT). That answer is **fair price**. The bot draws a **fence** (Price Watcher band) around fair — e.g. ±1% — and refuses to let **itself** buy too high or sell too low (`prevent` mode).
 
-### Liquidity (LIQ) — **main inventory risk**
+It **still posts quotes on Coinstore** using Coinstore’s own order book shape. Fair price (OKX) and quote placement (Coinstore) are **related but not identical** — see [PW vs liq](#pw-vs-liq-two-different-clocks) below.
 
-- **Layman:** Bulk buy/sell quotes in the real market (~±2% from mid). Most **frozen** balance lives here.
-- **Technical:** `mm_liquidity_provider.js` — depth orders (`purpose: liq`), caps `mm_liquiditySellAmount` / `mm_liquidityBuyQuoteAmount`, refreshed ~10–20s, clamped to PW band.
-- **Enable shape:** `/enable liq 2% 12 JITOSOL 1200 USDT middle`
-  - `2%` — spread width from mid (how far quotes sit)
-  - `12 JITOSOL` — max sell-side inventory posted
-  - `1200 USDT` — max buy-side quote posted
-  - `middle` — center quotes (`uptrend` / `downtrend` bias gap)
-- **Check:** `/orders JITOSOL/USDT` → `Liquidity liq:` line; `/balances` frozen vs free.
-- **Clear:** `/clear JITOSOL/USDT liq`
+---
+
+## Three ways the bot can set fair price
+
+| # | Name | When | Multiplier? | You control it? |
+|---|------|------|-------------|-----------------|
+| 1 | **OKX primary** | Normal | No | `/enable pw JITOSOL/USDT@OKX …` |
+| 2 | **OKX keyless** | OKX API key expired | No | Automatic — renew keys in config |
+| 3 | **Coinstore SOL fallback** | OKX completely unreachable | Yes (~1.285×) | `pw_fallback_source` in **config.jsonc only** |
+
+**Important:** Expired OKX keys do **not** switch you to Coinstore SOL. The bot keeps reading OKX public prices.
+
+---
+
+## Module primer
+
+### Price Watcher (PW) — the fair-price fence
+
+**Layman:** “OKX says JITOSOL is about $93. The bot is only allowed to trade between roughly $92 and $94 (with 1% deviation).”
+
+**What it does not do:** Spend your money to push the market back inside the fence (`prevent` mode). It also does **not** stop other people from filling your open orders.
+
+**Commands:** See RUNBOOK — `/enable pw JITOSOL/USDT@OKX 1% smart prevent -y`
+
+**How to check it is working:**
+
+```
+/params   → mm_priceWatcherSource should be JITOSOL/USDT@OKX
+```
+
+```bash
+pm2 logs tradebot --lines 80 | grep 'Active PW source'
+```
+
+**Good log:**
+
+```
+Active PW source: JITOSOL/USDT@OKX (direct, authenticated, no coefficient).
+```
+
+**On OKX primary you should NOT see:** `Applied cross-base coefficient` or `Falling back to SOL/USDT@Coinstore`.
+
+**Refresh speed:** OKX band updates every **15–30 seconds** (slower than the old same-exchange SOL feed at 3–7 s). That is normal.
+
+---
+
+### Liquidity (LIQ) — where most of your money sits on the book
+
+**Layman:** The bot posts chunky buy and sell orders near the **Coinstore JITOSOL** mid price — e.g. within ±0.5% or ±1%.
+
+**Risk:** Up to your liq caps can sit on the book (~600 USDT bids + ~6 JITOSOL asks in conservative mode). Someone can fill those orders; that is market-making, not a bug.
+
+**Commands:** `/enable liq 0.5% 6 JITOSOL 600 USDT middle` — see RUNBOOK.
+
+**Check:** `/orders JITOSOL/USDT` → `Liquidity liq:` line · `/balances` → frozen vs free.
+
+---
+
+### PW vs liq — two different clocks
+
+| | Price Watcher | Liquidity |
+|--|---------------|-----------|
+| **Reads** | OKX JITOSOL/USDT | Coinstore JITOSOL/USDT book |
+| **Purpose** | Define fair / fence | Post actual quotes |
+| **Updates** | Every 15–30 s | Every ~10–20 s |
+
+**Why this matters:** Coinstore’s JITOSOL book can sit **~1% above** OKX fair (self-referential quoting). PW says fair is ~$93 from OKX; liq may still **try** to quote near Coinstore’s ~$94 mid.
+
+**What PW blocks today:**
+
+- **Buys** above the top of the PW band — ✓ capped
+- **Sells** below the bottom of the PW band — ✓ capped
+- **Sells above** the top of the band — **not** capped (existing behaviour)
+
+So aggressive **ask** prices can still appear high vs OKX until liq spread rules or you retune. Starting with **tight liq (0.5%)** and **MM off** reduces that risk while you validate OKX.
+
+---
 
 ### Order book builder (OB)
 
-- **Layman:** Tiny, short-lived orders (often **3–7 sec**) to animate the book — not main liquidity.
-- **Technical:** `mm_orderbook_builder.js` — up to `mm_orderBookOrdersCount` ob orders; heavy API use → **429 Too Many Requests** if too aggressive.
-- **Enable shape:** `/enable ob 8 25%`
-- **Mitigation:** `/disable ob` or `/enable ob 4 25%` when 429s appear.
-- **Clear:** `/clear JITOSOL/USDT ob`
+**Layman:** Small, fast orders to make the book look busy. Can trigger **429** (rate limit) if too many.
+
+**Mitigation:** `/disable ob` or `/enable ob 4 20%`.
+
+---
 
 ### Market-making (MM)
 
-- **Layman:** Creates volume (`optimal` = mix of spread + order-book trades).
-- **With liq on:** ~**80%** `executeInOrderBook`, ~**20%** `executeInSpread`. Real fills possible (e.g. sell ~0.51 JITOSOL @ ~90.28).
-- **Check:** `/stats JITOSOL/USDT`, logs `Market-making: Successfully executed mm-order`.
+**Layman:** Bot trades to create volume. Turn **off** until OKX PW is validated (~24h clean logs).
 
-### Manual (MAN)
+**Check:** `/stats JITOSOL/USDT` · logs `Successfully executed mm-order`.
 
-- **Layman:** Orders from `/fill`, `/buy`, etc. — not liq/ob/mm/pw.
-- **Check:** `/orders JITOSOL/USDT` → `Manual man:` count and USDT/JITOSOL totals.
-- **Clear:** `/clear JITOSOL/USDT man`
+---
 
-### Unknown (UNK)
+### Manual (MAN) / Unknown (UNK)
 
-- Orders on exchange not in bot DB. Compare exchange UI vs `/orders`. Investigate before clearing.
+- **MAN:** Orders you placed with `/fill`, `/buy`, etc.
+- **UNK:** On exchange but not in bot DB — investigate before clearing.
+
+---
+
+## Worked example (live-style numbers)
+
+Rough snapshot — always verify live:
+
+| Feed | Mid (USDT) |
+|------|------------|
+| OKX JITOSOL (fair) | ~**93.15** |
+| Coinstore SOL × 1.285 (fallback fair) | ~**93.24** |
+| Coinstore JITOSOL book (venue) | ~**94.36** |
+
+**PW band @ 1% on OKX primary:** about **$92.18 – $94.12**
+
+**If OKX dies → fallback:** band shifts only ~**$0.10** — fallback math is close to OKX today.
+
+**If you used Coinstore JITOSOL as fair (old mistake):** band center ~**$94.36** — about **$1.20 too high** vs OKX.
 
 ---
 
 ## Liquidity “at risk” (USDT framing)
 
-**Posted notional (both sides, liq only @ ~$91/JITOSOL):**
+**Conservative liq (`6 JITOSOL` / `600 USDT` @ ~$93):**
 
-- Sells: ~`mm_liquiditySellAmount` JITOSOL → ~**$1,090–1,230**
-- Buys: ~`mm_liquidityBuyQuoteAmount` USDT → ~**$1,200**
+- ~**$560** in JITOSOL asks (6 × 93)
+- ~**$600** in USDT bids
+- ~**$1,160** on the book — not the same as $1,160 *lost*
 
-**~$2.3k** can be **on the book** at once; that is **not** $2.3k loss.
+**One-sided worst case:** ~$600 bought or ~6 JITOSOL sold if the market takes one side.
 
-**One-sided pick-off cap (per direction):** ~**$1.2k** — either spend ~1200 USDT on buys or sell ~12 JITOSOL on asks. Add **manual** bid USDT if `man` orders exist.
-
-**Free balance** (not in open orders) is not at risk until the bot posts it.
-
-PW **`prevent`** stops the **bot** from trading outside the band; it does **not** stop the market from lifting your in-band quotes.
+PW **`prevent`** stops the **bot** from new bad trades; it does **not** un-fill orders already on the book.
 
 ---
 
-## Adversarial / spoof orders
+## Monitoring
 
-**Common pattern on JITOSOL/USDT:** far bids ($0.65–$31) and far asks ($1,000–$11,000). **Usually harmless** — bot uses **top of book** (`highestBid` / `lowestAsk`), PW uses **SOL**.
-
-**Real risk:** informed traders filling **your liq** at ~$89–$92 (inventory skew / adverse selection), not deep-book spam.
-
-**Only worry about spoof** if absurd prices become **#1 bid or #1 ask** → `/stop mm`, assess, Coinstore support.
-
----
-
-## Monitoring cadence
-
-### Daily (~5 min) — Adamant
+### Daily Adamant (~5 min)
 
 ```
 /params
@@ -114,95 +160,61 @@ PW **`prevent`** stops the **bot** from trading outside the band; it does **not*
 
 | Signal | OK | Concern |
 |--------|-----|---------|
-| `liq` totals | Near caps, both sides | One side → 0 |
-| Free JITOSOL / USDT | Stable band vs target | Fast one-sided drift |
-| `man` | 0 | Leftover pre-market fills |
-| `unk` | 0 | Unknown orders |
-| PW in logs | `within Pw's range` | `Refusing to buy/sell` spam, JITOSOL ~$65 band |
+| `mm_priceWatcherSource` | `JITOSOL/USDT@OKX` | Still `SOL/USDT@Coinstore` after cutover |
+| `Active PW source` in logs | OKX, no coefficient | Fallback or coefficient on OKX day |
+| Liq both sides | Near caps | One side → 0 |
+| `man` / `unk` | 0 | Leftover unknowns |
 
-### Logs — VPS
-
-```bash
-pm2 logs tradebot --lines 80 | grep -E 'within Pw|429|Refusing|filled|Liquidity: Opened|coefficient'
-```
-
-### Rebalance
-
-Rebalance on **inventory skew** (>~15–20% off target), not on a calendar. Options: manual buy/sell on Coinstore, or retune liq caps:
-
-```
-/enable liq 2% 8 JITOSOL 1200 USDT middle
-/enable liq 2% 12 JITOSOL 800 USDT middle
-/clear JITOSOL/USDT man
-```
-
----
-
-## `pm2 restart tradebot` — safe when, risks
-
-**Safe because:** Restarts the **process** only. `/params` persist on disk (`tradeParams_*`). **Exchange orders stay open** (not auto-cancelled). DB kept unless `doClearDB` dev flag.
-
-**Helps:** Stale market cache (Gate B), after `config.jsonc` edit, recovery from 429/stuck iterations, morning refresh when Coinstore updates symbol metadata.
-
-**Risks:** ~5–30s blind window (no PW/liq updates); startup failure (1401, pair missing) leaves bot off while orders remain; **frequent** restarts worsen 429.
-
-**Not a fix for:** OB rate limits (disable OB first), inventory skew, spoof deep in book.
-
-**Procedure:**
+### Log grep (VPS)
 
 ```bash
-pm2 restart tradebot
-pm2 logs tradebot --lines 40
+pm2 logs tradebot --lines 80 | grep -E 'Active PW source|Falling back|cross-base coefficient|within Pw|429|Refusing'
 ```
 
-Then Adamant: `/params`, `/balances`, `/orders JITOSOL/USDT`.
+---
 
-**vs `/stop mm`:** stops trading logic without rebooting process.
+## Log cheat sheet (OKX era)
+
+| Log | Plain English |
+|-----|---------------|
+| `Active PW source: JITOSOL/USDT@OKX … no coefficient` | Healthy OKX anchor |
+| `OKX API: Authenticated request failed … keyless` | Keys bad; OKX still works; fix keys later |
+| `Falling back to SOL/USDT@Coinstore` | OKX down; emergency SOL×coef pricing |
+| `Applied cross-base coefficient 1.285…` | Expected on **fallback**; wrong on OKX primary |
+| `within Pw's range` | Activity inside fence |
+| `Refusing to buy higher than …` | PW doing its job |
+| `429 Too Many Requests` | Too much API — disable OB, slow MM |
 
 ---
 
-## Log pattern cheat sheet
+## Restart & stop
 
-| Log line | Meaning |
-|----------|---------|
-| `Applied cross-base coefficient 1.284… (fresh)` | PW anchor OK |
-| `within Pw's range` | Market inside band |
-| `Liquidity: Opened N bids… M asks…` | Liq deploy status |
-| `executeInOrderBook` + `filled` | Real MM trade |
-| `429 Too Many Requests` | API throttle — reduce OB or widen MM interval |
-| `Failed to get Txs in check()` | ADAMANT messenger noise — usually ignore |
-| `Unable to calculate JITOSOL price in USD` | Infoservice — usually ignore |
-| `Unable to find both USDT/USDT` | Harmless PW log when source is USDT-quoted |
-| `It's expired` + ob-order cancel | Normal OB rotation |
-| `unknown orders unk` | Exchange orders not in DB — investigate |
+**`pm2 restart tradebot`:** Safe for config changes and cache refresh. Orders stay open on Coinstore. ~5–30 s gap with no updates.
+
+**`/stop mm`:** Stops trading logic without killing the process.
+
+After restart: `/params`, `/balances`, grep `Active PW source`.
 
 ---
 
-## Common operator questions → answer shape
+## Common questions
 
-1. **Where is my money at risk?** → Liq caps + manual bids; USDT one-sided math; PW does not block fills.
-2. **Adversarial orders?** → Far book = noise unless BBO; real flow vs your liq.
-3. **PW vs Friday anchor?** → Live SOL × coef; show band from logs.
-4. **OB vs LIQ?** → LIQ = bulk/risk; OB = cosmetic/429 risk.
-5. **Restart safe?** → Yes with caveats; procedure above.
-6. **Check manual orders?** → `/orders JITOSOL/USDT` → `man:` line; `/clear JITOSOL/USDT man`.
-7. **Opening day tune?** → 2.5% PW, `/interval 5-22 sec` after volume, `/disable ob` or fewer ob on 429.
+**Which doc has commands?** → [RUNBOOK.md](./RUNBOOK.md)
+
+**Which doc is deploy / OKX keys?** → [OKX_PW_SETUP.md](./OKX_PW_SETUP.md)
+
+**Can I choose SOL instead of OKX?** → Yes: `/enable pw SOL/USDT@Coinstore 1% smart prevent -y` — but you lose the external anchor (not recommended).
+
+**Can I change fallback from Adamant?** → No. Edit `pw_fallback_source` in `config.jsonc` and restart.
+
+**Is spoof book junk a problem?** → Usually no unless fake prices become **#1 bid/ask**. PW ignores deep junk; it uses OKX for fair.
+
+**Opening day tune after OKX validated?** → Widen liq to 1% / 8 JITOSOL / 800 USDT; `/interval 10-40 sec`; MM on last.
 
 ---
 
-## Evidence to request (if not pasted)
+## Evidence to paste when asking for help
 
-1. Adamant: `/params`, `/balances`, `/orders JITOSOL/USDT`, `/stats JITOSOL/USDT` (errors too)
+1. Adamant: `/params`, `/balances`, `/orders JITOSOL/USDT`
 2. VPS: `pm2 logs tradebot --lines 80`
-
-Optional: what changed last (`/enable`, restart, config edit).
-
----
-
-## Beyond Adamant
-
-- Coinstore UI for full order list and unknowns
-- External SOL price alerts (PW tracks SOL)
-- Simple daily balance spreadsheet
-- Keep OB light to avoid 429
-- Coinstore support for persistent BBO spoof / wash
+3. What changed: deploy, `/enable pw`, config edit, restart

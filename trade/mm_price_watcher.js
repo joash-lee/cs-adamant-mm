@@ -123,6 +123,13 @@ let isPriceAnomaly = false; // Pw range, targeted to Pair@Exchange, is inconsist
 let setPriceRangeCount = 0;
 let pwExchange; let pwExchangeCoin1; let pwExchangeCoin2; let pwExchangeApi;
 
+let lastActivePwSource = null;
+let lastOkxAuthMode = null;
+let lastPwCoefficientApplied = null;
+let lastFallbackNotifyTimestamp = 0;
+
+const FALLBACK_NOTIFY_INTERVAL_MS = 60 * 60 * 1000;
+
 const PRICE_RANDOMIZATION_PERCENT = 0.2; // For any price source, randomize low and high bounds ±0.2%
 const HIGH_PRICE_ADDITION_PERCENT = 1;
 
@@ -282,6 +289,12 @@ module.exports = {
 
     if (tradeParams.mm_priceWatcherSource?.indexOf('@') > -1) {
       pwInfoString = `based on _${tradeParams.mm_priceWatcherSource}_ with _${tradeParams.mm_priceWatcherSourcePolicy}_ policy, _${tradeParams.mm_priceWatcherDeviationPercent.toFixed(2)}%_ deviation and _${tradeParams.mm_priceWatcherAction}_ action`;
+      if (config.pw_fallback_source) {
+        pwInfoString += ` (fallback: _${config.pw_fallback_source}_)`;
+      }
+      if (lastActivePwSource) {
+        pwInfoString += `; active: _${lastActivePwSource}_`;
+      }
     } else {
       if (tradeParams.mm_priceWatcherSource === config.coin2) {
         sourceString = `${tradeParams.mm_priceWatcherSource}`;
@@ -295,6 +308,20 @@ module.exports = {
 
     return pwInfoString;
   },
+
+  /**
+   * Runtime PW source state for operator visibility
+   * @returns {{ lastActivePwSource: string|null, lastOkxAuthMode: string|null, lastPwCoefficientApplied: number|null }}
+   */
+  getPwRuntimeInfo() {
+    return {
+      lastActivePwSource,
+      lastOkxAuthMode,
+      lastPwCoefficientApplied,
+    };
+  },
+
+  computeRangeFromSource,
 
   /**
    * Returns log string for other modules
@@ -356,10 +383,12 @@ module.exports = {
       exchange.toLowerCase() !== config.exchange &&
       (pwExchange !== exchange || pwExchangeCoin1 !== coin1 || pwExchangeCoin2 !== coin2)
     ) {
+      const [extApiKey, extApiSecret, extApiPassword] = orderUtils.getExternalExchangeCredentials(exchange.toLowerCase());
+
       pwExchangeApi = require('./trader_' + exchange.toLowerCase())(
-          null, // API credentials
-          null,
-          null,
+          extApiKey,
+          extApiSecret,
+          extApiPassword,
           log, // Same logger
           true, // publicOnly, no private endpoints
           undefined, // loadMarket, usually true by default
@@ -777,6 +806,227 @@ async function isEnoughCoins(coin1, coin2, amount1, amount2, type, noCache = fal
 }
 
 /**
+ * Computes PW price range bounds from a Pair@Exchange source string.
+ * @param {string} sourceString e.g. JITOSOL/USDT@OKX
+ * @param {boolean} isFallback Whether this is the config pw_fallback_source path
+ * @returns {Promise<{ ok: boolean, l?: number, h?: number, errorMessage?: string, activeSourceLabel?: string, appliedCoefficient?: number|null, isCrossBase?: boolean, targetExchange?: string }>}
+ */
+async function computeRangeFromSource(sourceString, isFallback = false) {
+  const coin2Decimals = orderUtils.parseMarket(config.pair).coin2Decimals;
+
+  const targetPair = sourceString.split('@')[0];
+  const targetExchange = sourceString.split('@')[1];
+
+  const targetPairObj = orderUtils.parseMarket(targetPair, targetExchange, true);
+  if (targetPairObj.marketInfoSupported && !targetPairObj.isParsed) {
+    return {
+      ok: false,
+      errorMessage: `Unable to get market info for ${targetPair} pair at ${targetExchange} exchange. It may be a temporary API error.`,
+    };
+  }
+
+  module.exports.setPwExchangeApi(targetExchange, targetPairObj.coin1, targetPairObj.coin2);
+
+  let orderBook;
+  if (targetExchange.toLowerCase() === config.exchange) {
+    orderBook = await orderUtils.getOrderBookCached(targetPairObj.pair, utils.getModuleName(module.id), true);
+  } else {
+    orderBook = await pwExchangeApi.getOrderBook(targetPair);
+  }
+
+  if (!orderBook || !orderBook.asks[0] || !orderBook.bids[0]) {
+    return {
+      ok: false,
+      errorMessage: `Unable to get the order book for ${targetPair} at ${targetExchange} exchange. It may be a temporary API error.`,
+    };
+  }
+
+  const orderBookInfo = utils.getOrderBookInfo(orderBook, 0, false);
+  if (!orderBookInfo || !orderBookInfo.smartAsk || !orderBookInfo.smartBid) {
+    return {
+      ok: false,
+      errorMessage: `Unable to calculate the orderBookInfo for ${targetPair} at ${targetExchange} exchange.`,
+    };
+  }
+
+  const bidPriceStrict = orderBook.bids[0].price;
+  const askPriceStrict = orderBook.asks[0].price;
+
+  const targetObSpreadStrict = utils.numbersDifferencePercent(bidPriceStrict, askPriceStrict);
+  const targetObSpreadSmart = utils.numbersDifferencePercent(orderBookInfo.smartBid, orderBookInfo.smartAsk);
+
+  let targetObString = `Got reference ${sourceString} target order book.`;
+  targetObString += ` Strict prices are ${bidPriceStrict.toFixed(targetPairObj.coin2Decimals)}—${askPriceStrict.toFixed(targetPairObj.coin2Decimals)} ${targetPairObj.coin2} (${targetObSpreadStrict.toFixed(2)}% spread),`;
+  targetObString += ` smart are ${orderBookInfo.smartBid.toFixed(targetPairObj.coin2Decimals)}—${orderBookInfo.smartAsk.toFixed(targetPairObj.coin2Decimals)} ${targetPairObj.coin2} (${targetObSpreadSmart.toFixed(2)}% spread).`;
+  log.log(`Price watcher: ${targetObString}`);
+
+  let bidPriceInTargetCoin; let askPriceInTargetCoin;
+  if (tradeParams.mm_priceWatcherSourcePolicy === 'strict') {
+    bidPriceInTargetCoin = bidPriceStrict;
+    askPriceInTargetCoin = askPriceStrict;
+  } else {
+    bidPriceInTargetCoin = orderBookInfo.smartBid;
+    askPriceInTargetCoin = orderBookInfo.smartAsk;
+  }
+
+  let l; let h;
+  let differenceString = '';
+  let priceRangeInfoString = '';
+
+  if (config.pair === targetPairObj.pair) {
+    l = bidPriceInTargetCoin;
+    h = askPriceInTargetCoin;
+    differenceString = ` (the same pair but on ${targetExchange} exchange)`;
+  } else {
+    let crossMarketBid; let crossMarketAsk;
+
+    let crossMarketPair = `${config.coin2}/${targetPairObj.coin2}`;
+    let crossMarket = orderUtils.parseMarket(crossMarketPair, targetExchange, true);
+
+    if (!crossMarket.isParsed || crossMarket.isReversed) {
+      crossMarketPair = `${targetPairObj.coin2}/${config.coin2}`;
+      crossMarket = orderUtils.parseMarket(crossMarketPair, targetExchange, true);
+    }
+
+    if (crossMarket.isParsed) {
+      const crossMarketRates = await pwExchangeApi.getRates(crossMarketPair);
+      if (!crossMarketRates) {
+        return {
+          ok: false,
+          errorMessage: `Unable to get rates for the ${crossMarketPair} cross-pair at ${targetExchange} exchange. It may be a temporary API error.`,
+        };
+      }
+
+      crossMarketBid = crossMarketRates.bid;
+      crossMarketAsk = crossMarketRates.ask;
+
+      const crossMarketSpread = utils.numbersDifferencePercent(crossMarketBid, crossMarketAsk);
+      priceRangeInfoString += `Found rates for the ${crossMarketPair} cross-pair at ${targetExchange} exchange: bid is ${crossMarketBid.toFixed(crossMarket.coin2Decimals)}, ask is ${crossMarketAsk.toFixed(crossMarket.coin2Decimals)} (${crossMarketSpread.toFixed(2)}% spread).`;
+      priceRangeInfoString += ` Using these rates for ${targetPairObj.coin2} -> ${config.coin2} conversion.`;
+
+      l = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, bidPriceInTargetCoin, false, crossMarketBid)
+          .outAmount;
+      h = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, askPriceInTargetCoin, false, crossMarketAsk)
+          .outAmount;
+    } else {
+      const crossMarketGlobalRate = exchangerUtils.getRate(targetPairObj.coin2, config.coin2);
+
+      l = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, bidPriceInTargetCoin, false).outAmount;
+      h = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, askPriceInTargetCoin, false).outAmount;
+
+      priceRangeInfoString += `Unable to find both ${config.coin2}/${targetPairObj.coin2} and ${targetPairObj.coin2}/${config.coin2} markets on ${targetExchange} exchange.`;
+      priceRangeInfoString += ` Using the global conversion rate: 1 ${targetPairObj.coin2} = ${crossMarketGlobalRate.toFixed(coin2Decimals)} ${config.coin2}.`;
+    }
+
+    log.log(`Price watcher: ${priceRangeInfoString}`);
+  }
+
+  if (!utils.isPositiveNumber(l) || !utils.isPositiveNumber(h)) {
+    return {
+      ok: false,
+      errorMessage: `Wrong results of exchangerUtils.convertCryptos function: l=${l}, h=${h}.`,
+    };
+  }
+
+  log.log(`Price watcher: Calculated the ${config.pair} price range according to ${targetPair} at ${targetExchange} exchange (${tradeParams.mm_priceWatcherSourcePolicy} policy) — from ${l.toFixed(coin2Decimals)} to ${h.toFixed(coin2Decimals)} ${config.coin2}${differenceString}.`);
+
+  const l_global = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, bidPriceInTargetCoin, false).outAmount;
+  const h_global = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, askPriceInTargetCoin, false).outAmount;
+  const lDifferencePercent = utils.numbersDifferencePercent(l, l_global);
+  const hDifferencePercent = utils.numbersDifferencePercent(h, h_global);
+
+  let rangeDifferenceString = `Difference between ${sourceString} and global ${config.coin1} rates is excessive:`;
+  rangeDifferenceString += ` low bound is ${l.toFixed(coin2Decimals)} vs ${l_global.toFixed(coin2Decimals)} ${config.coin2} (diff ${lDifferencePercent.toFixed(2)}%),`;
+  rangeDifferenceString += ` high bound is ${h.toFixed(coin2Decimals)} vs ${h_global.toFixed(coin2Decimals)} ${config.coin2} (diff ${hDifferencePercent.toFixed(2)}%).`;
+
+  if (Math.max(lDifferencePercent, hDifferencePercent) > ALLOWED_GLOBAL_RATE_DIFFERENCE_PERCENT) {
+    anomalyPriceRange(rangeDifferenceString);
+
+    if (GLOBAL_RATE_DIFFERENCE_ACTION === 'block') {
+      isPriceAnomaly = true;
+    }
+  } else {
+    isPriceAnomaly = false;
+  }
+
+  const targetCoin1 = targetPairObj.coin1;
+  const isCrossBase = targetCoin1 !== config.coin1;
+  let appliedCoefficient = null;
+
+  if (isCrossBase) {
+    const coefResult = await jitoCoefficient.getCoefficient();
+    let coef = coefResult.coefficient;
+    let coefDescription = coefResult.description;
+
+    if (coef === null) {
+      const configCoef = +config.pw_source_coefficient;
+      if (utils.isPositiveNumber(configCoef)) {
+        coef = configCoef;
+        coefDescription = `Jito API unavailable (${coefResult.description}), using static config pw_source_coefficient=${coef}`;
+        log.warn(`Price watcher: ${coefDescription}`);
+      }
+    }
+
+    if (coef === null) {
+      return {
+        ok: false,
+        errorMessage:
+            `Cross-base PW source ${targetPair}@${targetExchange}→${config.coin1} requires a valid JitoSOL/SOL coefficient. ` +
+            `Jito API: ${coefResult.description}. No valid pw_source_coefficient in config. Not applying coefficient=1.`,
+      };
+    }
+
+    l = l * coef;
+    h = h * coef;
+    appliedCoefficient = coef;
+    log.log(`Price watcher: Applied cross-base coefficient ${coef.toFixed(6)} (${coefResult.status ?? 'config-fallback'}) → range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2}. ${coefDescription}`);
+  } else if (utils.isPositiveNumber(+config.pw_source_coefficient)) {
+    const coef = +config.pw_source_coefficient;
+    l = l * coef;
+    h = h * coef;
+    appliedCoefficient = coef;
+    log.log(`Price watcher: Applied config pw_source_coefficient ${coef}: range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2}.`);
+  }
+
+  const preDeviationL = l;
+  const preDeviationH = h;
+  l = l * (1 - tradeParams.mm_priceWatcherDeviationPercent/100);
+  h = h * (1 + tradeParams.mm_priceWatcherDeviationPercent/100);
+
+  log.log(`Price watcher: Applied ${tradeParams.mm_priceWatcherDeviationPercent.toFixed(2)}% deviation → range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2} (pre-deviation ${preDeviationL.toFixed(coin2Decimals)}–${preDeviationH.toFixed(coin2Decimals)}).`);
+
+  let okxAuthMode = null;
+  if (targetExchange.toLowerCase() === 'okx' && typeof pwExchangeApi.getLastAuthMode === 'function') {
+    okxAuthMode = pwExchangeApi.getLastAuthMode();
+  }
+
+  let activeSourceLabel;
+  if (isFallback) {
+    activeSourceLabel = isCrossBase ?
+        `${sourceString} (fallback, cross-base, coefficient applied)` :
+        `${sourceString} (fallback)`;
+  } else if (targetExchange.toLowerCase() === 'okx' && !isCrossBase) {
+    activeSourceLabel = `${sourceString} (direct, ${okxAuthMode || 'keyless'}, no coefficient)`;
+  } else if (isCrossBase) {
+    activeSourceLabel = `${sourceString} (cross-base, coefficient applied)`;
+  } else {
+    activeSourceLabel = `${sourceString} (direct, no coefficient)`;
+  }
+
+  return {
+    ok: true,
+    l,
+    h,
+    activeSourceLabel,
+    appliedCoefficient,
+    isCrossBase,
+    targetExchange,
+    okxAuthMode,
+    isFallback,
+  };
+}
+
+/**
  * Calculates the Pw's price range, updating the module's vars:
  * - lowPrice: lower limit
  * - highPrice: higher limit
@@ -792,7 +1042,6 @@ async function setPriceRange() {
 
     setPriceRangeCount += 1;
     let l; let h;
-    let l_global; let h_global; let lDifferencePercent; let hDifferencePercent; let differenceString = '';
 
     // Calculate the price range
 
@@ -803,191 +1052,35 @@ async function setPriceRange() {
       setLowHighPrices(-1);
 
     } else if (tradeParams.mm_priceWatcherSource?.indexOf('@') > -1) {
-      // Price range is set targeted to other pair like ADM/USDT@Azbit or ADM/BTC@Biconomy
-      // Coin1 always equals config.coin1
+      const primarySource = tradeParams.mm_priceWatcherSource;
+      let rangeResult = await computeRangeFromSource(primarySource, false);
 
-      const targetPair = tradeParams.mm_priceWatcherSource.split('@')[0];
-      const targetExchange = tradeParams.mm_priceWatcherSource.split('@')[1];
+      if (!rangeResult.ok && config.pw_fallback_source && primarySource !== config.pw_fallback_source) {
+        log.warn(`Price watcher: Primary source ${primarySource} unavailable (${rangeResult.errorMessage}). Falling back to ${config.pw_fallback_source}.`);
+        rangeResult = await computeRangeFromSource(config.pw_fallback_source, true);
 
-      const targetPairObj = orderUtils.parseMarket(targetPair, targetExchange, true);
-      if (targetPairObj.marketInfoSupported && !targetPairObj.isParsed) {
-        errorSettingPriceRange(`Unable to get market info for ${targetPair} pair at ${targetExchange} exchange. It may be a temporary API error.`);
-        return false;
-      }
-
-      module.exports.setPwExchangeApi(targetExchange, targetPairObj.coin1, targetPairObj.coin2);
-
-      let orderBook;
-      if (targetExchange.toLowerCase() === config.exchange) {
-        orderBook = await orderUtils.getOrderBookCached(targetPairObj.pair, utils.getModuleName(module.id), true);
-      } else {
-        orderBook = await pwExchangeApi.getOrderBook(targetPair);
-      }
-
-      if (!orderBook || !orderBook.asks[0] || !orderBook.bids[0]) {
-        errorSettingPriceRange(`Unable to get the order book for ${targetPair} at ${targetExchange} exchange. It may be a temporary API error.`);
-        return false;
-      }
-
-      const orderBookInfo = utils.getOrderBookInfo(orderBook, 0, false);
-      if (!orderBookInfo || !orderBookInfo.smartAsk || !orderBookInfo.smartBid) {
-        errorSettingPriceRange(`Unable to calculate the orderBookInfo for ${targetPair} at ${targetExchange} exchange.`);
-        return false;
-      }
-
-      const bidPriceStrict = orderBook.bids[0].price;
-      const askPriceStrict = orderBook.asks[0].price;
-
-      const targetObSpreadStrict = utils.numbersDifferencePercent(bidPriceStrict, askPriceStrict);
-      const targetObSpreadSmart = utils.numbersDifferencePercent(orderBookInfo.smartBid, orderBookInfo.smartAsk);
-
-      let targetObString = `Got reference ${tradeParams.mm_priceWatcherSource} target order book.`;
-      targetObString += ` Strict prices are ${bidPriceStrict.toFixed(targetPairObj.coin2Decimals)}—${askPriceStrict.toFixed(targetPairObj.coin2Decimals)} ${targetPairObj.coin2} (${targetObSpreadStrict.toFixed(2)}% spread),`;
-      targetObString += ` smart are ${orderBookInfo.smartBid.toFixed(targetPairObj.coin2Decimals)}—${orderBookInfo.smartAsk.toFixed(targetPairObj.coin2Decimals)} ${targetPairObj.coin2} (${targetObSpreadSmart.toFixed(2)}% spread).`;
-      log.log(`Price watcher: ${targetObString}`);
-
-      let bidPriceInTargetCoin; let askPriceInTargetCoin;
-      if (tradeParams.mm_priceWatcherSourcePolicy === 'strict') {
-        bidPriceInTargetCoin = bidPriceStrict; // E.g., 0.00000047 BTC for ADM/USDT@Biconomy
-        askPriceInTargetCoin = askPriceStrict; // E.g., 0.00000049 BTC
-      } else {
-        bidPriceInTargetCoin = orderBookInfo.smartBid;
-        askPriceInTargetCoin = orderBookInfo.smartAsk;
-      }
-
-      let priceRangeInfoString = '';
-
-      if (config.pair === targetPairObj.pair) {
-        // The same pair traded on another exchange
-        l = bidPriceInTargetCoin;
-        h = askPriceInTargetCoin;
-
-        differenceString = ` (the same pair but on ${targetExchange} exchange)`;
-      } else {
-        // Not the same pair, it may be on the same exchange or on another
-        // Get cross-market rates for config.coin2 / pairObj.coin2 and compare with global rates
-        // E.g., ADM/USDT@Azbit targeted to ADM/BTC@Azbit or ADM/BTC@Biconomy. Working with the target exchange.
-
-        let crossMarketBid; let crossMarketAsk;
-
-        // Try direct rate
-        let crossMarketPair = `${config.coin2}/${targetPairObj.coin2}`; // E.g., USDT/BTC
-        let crossMarket = orderUtils.parseMarket(crossMarketPair, targetExchange, true);
-
-        if (!crossMarket.isParsed || crossMarket.isReversed) { // Consider the DEX's isReversed as no market found, as we try the inversed rate especially
-          // Try inversed rate
-          crossMarketPair = `${targetPairObj.coin2}/${config.coin2}`; // USDT/BTC -> BTC/USDT
-          crossMarket = orderUtils.parseMarket(crossMarketPair, targetExchange, true);
-        }
-
-        if (crossMarket.isParsed) {
-          // Found the cross-market on a target exchange
-
-          const crossMarketRates = await pwExchangeApi.getRates(crossMarketPair);
-          if (!crossMarketRates) {
-            errorSettingPriceRange(`Unable to get rates for the ${crossMarketPair} cross-pair at ${targetExchange} exchange. It may be a temporary API error.`);
-            return false;
-          }
-
-          crossMarketBid = crossMarketRates.bid; // E.g., 64400 for BTC/USDT
-          crossMarketAsk = crossMarketRates.ask; // E.g., 64600 for BTC/USDT
-
-          const crossMarketSpread = utils.numbersDifferencePercent(crossMarketBid, crossMarketAsk);
-          priceRangeInfoString += `Found rates for the ${crossMarketPair} cross-pair at ${targetExchange} exchange: bid is ${crossMarketBid.toFixed(crossMarket.coin2Decimals)}, ask is ${crossMarketAsk.toFixed(crossMarket.coin2Decimals)} (${crossMarketSpread.toFixed(2)}% spread).`;
-          priceRangeInfoString += ` Using these rates for ${targetPairObj.coin2} -> ${config.coin2} conversion.`;
-
-          l = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, bidPriceInTargetCoin, false, crossMarketBid)
-              .outAmount; // E.g., 0.00000047 BTC -> 0.0302 USDT
-          h = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, askPriceInTargetCoin, false, crossMarketAsk)
-              .outAmount; // E.g., 0.00000049 BTC -> 0.0316 USDT
-        } else {
-          // Both direct and reversed pairs don't exist on the target exchange, using global exchange rates
-          const crossMarketGlobalRate = exchangerUtils.getRate(targetPairObj.coin2, config.coin2); // E.g., 1 BTC = 64500 USDT
-
-          l = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, bidPriceInTargetCoin, false).outAmount;
-          h = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, askPriceInTargetCoin, false).outAmount;
-
-          priceRangeInfoString += `Unable to find both ${config.coin2}/${targetPairObj.coin2} and ${targetPairObj.coin2}/${config.coin2} markets on ${targetExchange} exchange.`;
-          priceRangeInfoString += ` Using the global conversion rate: 1 ${targetPairObj.coin2} = ${crossMarketGlobalRate.toFixed(coin2Decimals)} ${config.coin2}.`;
-        }
-
-        log.log(`Price watcher: ${priceRangeInfoString}`);
-      } // The same pair or not for the Pair@Exchange case
-
-      if (!utils.isPositiveNumber(l) || !utils.isPositiveNumber(h)) {
-        errorSettingPriceRange(`Wrong results of exchangerUtils.convertCryptos function: l=${l}, h=${h}.`);
-        return false;
-      }
-
-      log.log(`Price watcher: Calculated the ${config.pair} price range according to ${targetPair} at ${targetExchange} exchange (${tradeParams.mm_priceWatcherSourcePolicy} policy) — from ${l.toFixed(coin2Decimals)} to ${h.toFixed(coin2Decimals)} ${config.coin2}${differenceString}.`);
-
-      // Verify that calculated price range is consistent with the Infoservice (global rates as CMC/Cg)
-
-      l_global = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, bidPriceInTargetCoin, false).outAmount;
-      h_global = exchangerUtils.convertCryptos(targetPairObj.coin2, config.coin2, askPriceInTargetCoin, false).outAmount;
-      lDifferencePercent = utils.numbersDifferencePercent(l, l_global);
-      hDifferencePercent = utils.numbersDifferencePercent(h, h_global);
-
-      let rangeDifferenceString = `Difference between ${tradeParams.mm_priceWatcherSource} and global ${config.coin1} rates is excessive:`;
-      rangeDifferenceString += ` low bound is ${l.toFixed(coin2Decimals)} vs ${l_global.toFixed(coin2Decimals)} ${config.coin2} (diff ${lDifferencePercent.toFixed(2)}%),`;
-      rangeDifferenceString += ` high bound is ${h.toFixed(coin2Decimals)} vs ${h_global.toFixed(coin2Decimals)} ${config.coin2} (diff ${hDifferencePercent.toFixed(2)}%).`;
-
-      if (Math.max(lDifferencePercent, hDifferencePercent) > ALLOWED_GLOBAL_RATE_DIFFERENCE_PERCENT) {
-        anomalyPriceRange(rangeDifferenceString);
-
-        if (GLOBAL_RATE_DIFFERENCE_ACTION === 'block') {
-          isPriceAnomaly = true;
-        }
-      } else {
-        isPriceAnomaly = false;
-      }
-
-      // Apply a price coefficient for pegged assets, e.g. JITOSOL = SOL * exchange_rate.
-      // Cross-base sources (source coin1 ≠ traded coin1) MUST have a valid coefficient.
-      // Fail closed if no coefficient is available — never silently default to 1.
-      const targetCoin1 = targetPairObj.coin1;
-      const isCrossBase = targetCoin1 !== config.coin1;
-
-      if (isCrossBase) {
-        // Try the live Jito stake-pool coefficient (primary source).
-        const coefResult = await jitoCoefficient.getCoefficient();
-        let coef = coefResult.coefficient;
-        let coefDescription = coefResult.description;
-
-        if (coef === null) {
-          // Live source unavailable; try the static config fallback.
-          const configCoef = +config.pw_source_coefficient;
-          if (utils.isPositiveNumber(configCoef)) {
-            coef = configCoef;
-            coefDescription = `Jito API unavailable (${coefResult.description}), using static config pw_source_coefficient=${coef}`;
-            log.warn(`Price watcher: ${coefDescription}`);
-          }
-        }
-
-        if (coef === null) {
-          // Both sources exhausted — fail closed.
-          errorSettingPriceRange(
-              `Cross-base PW source ${targetPair}@${targetExchange}→${config.coin1} requires a valid JitoSOL/SOL coefficient. ` +
-              `Jito API: ${coefResult.description}. No valid pw_source_coefficient in config. Not applying coefficient=1.`,
+        if (rangeResult.ok && Date.now() - lastFallbackNotifyTimestamp > FALLBACK_NOTIFY_INTERVAL_MS) {
+          notify(
+              `${config.notifyName}: Price watcher fell back from ${primarySource} to ${config.pw_fallback_source}. Band center may shift. Check OKX connectivity and credentials.`,
+              'warn',
           );
-          return false;
+          lastFallbackNotifyTimestamp = Date.now();
         }
-
-        l = l * coef;
-        h = h * coef;
-        log.log(`Price watcher: Applied cross-base coefficient ${coef.toFixed(6)} (${coefResult.status ?? 'config-fallback'}) → range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2}. ${coefDescription}`);
-      } else if (utils.isPositiveNumber(+config.pw_source_coefficient)) {
-        // Same-base source but an explicit coefficient is configured — apply it.
-        const coef = +config.pw_source_coefficient;
-        l = l * coef;
-        h = h * coef;
-        log.log(`Price watcher: Applied config pw_source_coefficient ${coef}: range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2}.`);
       }
-      // Same-base source with no coefficient: coefficient is implicitly 1 (existing behaviour).
 
-      // Use allowed price deviation mm_priceWatcherDeviationPercent
-      l = l * (1 - tradeParams.mm_priceWatcherDeviationPercent/100);
-      h = h * (1 + tradeParams.mm_priceWatcherDeviationPercent/100);
+      if (!rangeResult.ok) {
+        errorSettingPriceRange(rangeResult.errorMessage);
+        return false;
+      }
+
+      l = rangeResult.l;
+      h = rangeResult.h;
+
+      lastActivePwSource = rangeResult.activeSourceLabel;
+      lastOkxAuthMode = rangeResult.targetExchange?.toLowerCase() === 'okx' ? rangeResult.okxAuthMode : null;
+      lastPwCoefficientApplied = rangeResult.appliedCoefficient;
+
+      log.log(`Price watcher: Active PW source: ${lastActivePwSource}.`);
 
       setLowHighPrices(l, h);
     } else {

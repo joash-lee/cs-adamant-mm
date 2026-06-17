@@ -1,21 +1,100 @@
 # Troubleshooting — Coinstore JITOSOL/USDT bot
 
-## What to paste when asking for help
-
-Always provide **both**:
-
-1. **Adamant** — full bot reply for the command you ran (e.g. `/params`, `/orders`, `/stats`, error text).
-2. **VPS logs** — `pm2 logs tradebot --lines 80` (or more around the incident).
-
-Optional: what you changed last (`/enable`, config edit, restart).
+When something breaks, paste **Adamant output** + **`pm2 logs tradebot --lines 80`**. See [RUNBOOK.md](./RUNBOOK.md) for correct commands; [OPERATOR_GUIDE.md](./OPERATOR_GUIDE.md) for behaviour.
 
 ---
 
-## Gate A — Authentication (`1401`)
+## Price Watcher / OKX anchor
 
-**Layman:** Coinstore rejects the bot's login — usually wrong IP leaving the server.
+### Healthy (OKX primary)
 
-**Technical:** `X-CS-SIGN` OK but source IP not whitelisted; dual-stack VPS often exits on IPv6.
+**`/params` shows:**
+
+```
+mm_priceWatcherSource: "JITOSOL/USDT@OKX"
+mm_priceWatcherDeviationPercent: 1  (or your chosen %)
+mm_priceWatcherAction: "prevent"
+```
+
+**Logs show:**
+
+```
+Active PW source: JITOSOL/USDT@OKX (direct, authenticated, no coefficient).
+```
+
+**You should NOT see** (while OKX is up): `Applied cross-base coefficient`, `Falling back to SOL/USDT@Coinstore`.
+
+---
+
+### OKX API key expired (still OK)
+
+**Symptoms:** Warn about keyless; band still tracks OKX.
+
+**Logs:**
+
+```
+OKX API: Authenticated request failed (...). Retrying public keyless request.
+Active PW source: JITOSOL/USDT@OKX (direct, keyless, no coefficient).
+```
+
+**Fix (when convenient):** New Read-only OKX key → update `okx_api*` in `config.jsonc` → `pm2 restart tradebot`. See [OKX_PW_SETUP.md](./OKX_PW_SETUP.md).
+
+---
+
+### OKX fully down (automatic fallback)
+
+**Symptoms:** Notify/warn about fallback; band may shift slightly (~$0.10 vs OKX).
+
+**Logs:**
+
+```
+Primary source JITOSOL/USDT@OKX unavailable (...). Falling back to SOL/USDT@Coinstore.
+Applied cross-base coefficient 1.285…
+Active PW source: SOL/USDT@Coinstore (fallback, cross-base, coefficient applied).
+```
+
+**Plain English:** Bot is using Coinstore SOL price × Jito multiplier — the **old** method as emergency backup.
+
+**Fix:** Wait for OKX connectivity; or check VPS outbound HTTPS. Fallback is automatic — no Adamant command.
+
+**Config involved:** `pw_fallback_source`, `pw_source_coefficient` (if Jito API also down).
+
+---
+
+### Wrong fair price (~$65 or tracks Coinstore JITOSOL book)
+
+| Symptom | Likely cause |
+|---------|--------------|
+| Fair ~$65 (SOL spot) | PW off, wrong source, or coef broken |
+| Fair ~$94+ while OKX ~$93 | Primary still `SOL/USDT@Coinstore` or PW disabled; venue book loop |
+| `coefficient` on OKX primary day | Bug or fallback active — grep `Active PW source` |
+
+**Fix:**
+
+```
+/stop mm
+/enable pw JITOSOL/USDT@OKX 1% smart prevent -y
+```
+
+Verify `/params` and logs. See RUNBOOK cutover sequence.
+
+---
+
+### Legacy: SOL as *primary* (you chose it)
+
+If you explicitly ran `/enable pw SOL/USDT@Coinstore …`, logs **will** show `Applied cross-base coefficient` every cycle — that is expected for that mode.
+
+To return to OKX:
+
+```
+/enable pw JITOSOL/USDT@OKX 1% smart prevent -y
+```
+
+---
+
+## Gate A — Coinstore auth (`1401`)
+
+**Layman:** Coinstore rejects login — usually wrong IP leaving the server.
 
 ```bash
 curl -s https://ifconfig.me && echo
@@ -23,122 +102,64 @@ curl -s -4 https://api.ipify.org && echo
 curl -s -6 https://api.ipify.org && echo
 ```
 
-**Fix options:**
+**Fix:** Whitelist VPS IPv4 **and** IPv6 on Coinstore API key, or force IPv4 (see RUNBOOK / old notes below).
 
-| Option | CLI |
-|--------|-----|
-| A (preferred) | Add VPS IPv6 `2a02:4780:5e:64b::1` to Coinstore API key whitelist |
-| B | `pm2 delete tradebot && pm2 start app.js --name tradebot --node-args="--dns-result-order=ipv4first" && pm2 save` |
-| C | Code: force `family: 4` in axios — **hand off to coding agent** |
-
-Canary: `/balances` must succeed without `1401`.
-
-Cascade in logs (all one root cause): `1401` → `balances.filter is not a function` → `Cannot read properties of undefined`.
+Canary: `/balances` without `1401`.
 
 ---
 
-## Gate B — Pair not found (stale cache)
+## Gate B — Pair not found
 
-**Layman:** Coinstore has the pair; the bot still uses an old list from when it started.
-
-**Technical:** `getMarkets()` caches at startup; `parseMarket` fails locally — no order API call.
+**Layman:** Bot started before Coinstore listed the pair; cache is stale.
 
 ```
 /pair JITOSOL/USDT
-```
-
-**Fix:**
-
-```bash
 pm2 restart tradebot
-```
-
-If still failing: tickers curl check:
-
-```bash
-curl -s https://api.coinstore.com/api/v1/market/tickers | \
-  python3 -c "import sys,json; d=json.load(sys.stdin); print([t for t in d.get('data',[]) if 'JITOSOL' in t.get('symbol','')])"
 ```
 
 ---
 
 ## Gate B — Order rejected `3011` / `3013`
 
-| Code | Meaning | Action |
-|------|---------|--------|
-| 3011 | Symbol not found / not tradable for this key | Coinstore listing or pre-market whitelist |
-| 3013 | No spot trading qualification | Account not whitelisted for pre-market |
+| Code | Meaning |
+|------|---------|
+| 3011 | Symbol not tradable for this key |
+| 3013 | Account not whitelisted for spot |
 
-Not fixable by restart alone if catalog still excludes the pair.
+Not fixed by restart alone.
 
 ---
 
 ## Decimals trap
 
-**Layman:** With no trades yet, Coinstore reports prices as `0`; the bot thinks you can only trade whole coins.
+**Symptoms:** `After rounding to 0 decimal places` · whole JITOSOL only.
 
-**Symptoms:**
-
-- `After rounding to 0 decimal places, the order amount is wrong`
-- `0.7` JITOSOL silently becomes `1`
-
-**Workaround now:**
-
-```
-/buy JITOSOL/USDT amount=1 price=80
-/amount 1-4
-```
-
-**Check listing progress:**
-
-```bash
-curl -s -X POST "https://api.coinstore.com/api/v2/public/config/spot/symbols" \
-  -H 'Content-Type: application/json' -d '{"symbolCodes":["jitosolusdt"]}'
-```
-
-`data:[null]` = not in trade catalog yet. When listed, returns `tickSz`, `lotSz`, `minLmtSz`.
-
-**Permanent fix:** patch `trade/trader_coinstore.js` — **hand off to coding agent** (see RUNBOOK).
-
----
-
-## Price Watcher / coefficient
-
-**Correct:** `mm_priceWatcherSource: SOL/USDT@Coinstore`, logs show `Applied cross-base coefficient ~1.284`.
-
-**Wrong:** JITOSOL mid near SOL spot (~$65); static USDT band only; coefficient `1` or missing with cross-base source.
-
-**Verify:**
-
-```
-/params
-```
-
-Look for `mm_priceWatcherSource`, `mm_priceWatcherDeviationPercent`, `mm_priceWatcherAction: prevent`.
-
-**Enable:**
-
-```
-/enable pw SOL/USDT@Coinstore 3% smart prevent
-```
-
-Config fallback: `pw_source_coefficient: 1.2842` in `config.jsonc`.
+**Workaround:** `/amount 1-4` · integer sizes until `/pair` shows real decimals.
 
 ---
 
 ## Empty / one-sided order book
 
-**Layman:** Market-making needs a buy and a sell on the book; if only your bids exist, MM may refuse to trade.
-
-**Log:** `Unable to get order book` — `orderUtils` requires both bid and ask.
-
-**Fix:** Seed both sides (`/fill` or manual buy + sell far apart); avoid matching your own price (wash).
+MM and PW need **both** bid and ask. Seed with `/fill` or manual orders on both sides.
 
 ---
 
-## Self-trade warnings
+## Bot won't start after OKX update
 
-Pre-market: bot matches its own ob/liq orders. Expected. Mitigate: wider `/interval`, slightly wider liq spread, fewer ob orders.
+**Layman:** New code requires OKX keys in config.
+
+**Exit message examples:**
+
+- `Field _okx_apikey_ is required when OKX is in exchanges`
+- `Field _pw_fallback_source_ is required`
+
+**Fix:** Add keys + `"pw_fallback_source": "SOL/USDT@Coinstore"` to `config.jsonc` → restart. See OKX_PW_SETUP.
+
+---
+
+## Self-trade / 429
+
+Pre-market: self-trade warnings normal. **429:** `/disable ob`, widen `/interval`.
 
 ---
 
@@ -146,31 +167,28 @@ Pre-market: bot matches its own ob/liq orders. Expected. Mitigate: wider `/inter
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
-| 401 | API key / signature |
-| 1401 | IP whitelist / token |
-| 3005 | Signature generation |
+| 1401 | IP whitelist |
 | 3011 | Symbol not found |
 | 3013 | No spot qualification |
 | 3113 | Insufficient balance |
 
 ---
 
-## Key repo paths (read-only reference)
+## Key repo paths
 
 | Path | Role |
 |------|------|
-| `trade/trader_coinstore.js` | Markets cache, decimals, orders |
-| `trade/api/coinstore_api.js` | HTTP + signature |
-| `trade/mm_price_watcher.js` | PW + coefficient |
-| `helpers/cryptos/jitoCoefficient.js` | Jito stats API |
-| `modules/commandTxs.js` | Adamant commands |
-| `config.jsonc` | Exchange keys, `pw_source_coefficient` |
+| `trade/mm_price_watcher.js` | PW band, OKX primary, fallback |
+| `trade/trader_okx.js` | OKX read-only connector |
+| `trade/api/okx_api.js` | Auth + keyless retry |
+| `helpers/cryptos/jitoCoefficient.js` | Jito multiplier (fallback path) |
+| `modules/commandTxs.js` | `/enable pw` handling |
+| `config.jsonc` | OKX keys, `pw_fallback_source` |
 
 ---
 
 ## Ignore (usually)
 
-- `Failed to get Txs in check()` — ADAMANT nodes
+- `Failed to get Txs in check()` — ADAMANT messenger
+- `Unable to calculate JITOSOL price in USD` — Infoservice gap
 - `Unknown cryptos JITOSOL` on `/balances` USD total
-- `/stats` "no orders all time" — DB history vs open orders

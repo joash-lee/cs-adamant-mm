@@ -38,8 +38,22 @@ const balancesCachedValidMs = 1000;
 const moduleId = /** @type {NodeJS.Module} */ (module).id;
 const moduleName = utils.getModuleName(moduleId);
 
+/**
+ * Returns API credentials for external exchange connectors used by PW preflight.
+ * @param {string} exchangeLc Lowercase exchange name
+ * @returns {[string|null, string|null, string|null]}
+ */
+function getExternalExchangeCredentials(exchangeLc) {
+  if (exchangeLc === 'okx') {
+    return [config.okx_apikey, config.okx_apisecret, config.okx_apipassphrase];
+  }
+
+  return [null, null, null];
+}
+
 module.exports = {
   readableModuleName: 'orderUtils',
+  getExternalExchangeCredentials,
 
   /**
    * Returns cross-type order
@@ -303,10 +317,11 @@ module.exports = {
             return false;
           }
         } else {
+          const [extApiKey, extApiSecret, extApiPassword] = getExternalExchangeCredentials(exchangeLc);
           exchangeApi = require(`./trader_${exchangeLc}`)(
-              null, // API credentials
-              null,
-              null,
+              extApiKey,
+              extApiSecret,
+              extApiPassword,
               log, // Same logger
               true, // publicOnly, no private endpoints
               undefined, // loadMarket, usually true by default

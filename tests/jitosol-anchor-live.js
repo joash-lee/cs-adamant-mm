@@ -101,6 +101,8 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 const COINSTORE_TICKER_URL = 'https://api.coinstore.com/api/v1/ticker/price';
 const COINSTORE_DEPTH_URL = 'https://api.coinstore.com/api/v1/market/depth/SOLUSDT?depth=5&level=5';
+const OKX_TICKER_URL = 'https://www.okx.com/api/v5/market/ticker?instId=JITOSOL-USDT';
+const OKX_BOOKS_URL = 'https://www.okx.com/api/v5/market/books?instId=JITOSOL-USDT&sz=5';
 const BINANCE_EXCHANGE_INFO_URL = 'https://api.binance.com/api/v3/exchangeInfo?symbol=JTOUSDT';
 const BINANCE_JITOSOL_CHECK_URL = 'https://api.binance.com/api/v3/ticker/price?symbol=JITOSOLUSDT';
 
@@ -272,10 +274,56 @@ async function testCoinstoreSOL() {
   }
 }
 
-// ─── Test 4: Binance — Verify JitoSOL is NOT listed ─────────────────────────
+// ─── Test 4: OKX JITOSOL/USDT Primary Source ─────────────────────────────────
+
+async function testOkxJitosol() {
+  section('TEST 4: OKX JITOSOL/USDT primary PW source');
+  console.log(`  URL (ticker): ${OKX_TICKER_URL}`);
+
+  const tickerResult = await fetchJson(OKX_TICKER_URL);
+  assertTrue('OKX ticker HTTP request succeeded', tickerResult.ok, tickerResult.error);
+
+  if (tickerResult.ok && tickerResult.data) {
+    const data = tickerResult.data;
+    assertTrue('OKX response code is 0', data.code === '0', `code=${data.code} msg=${data.msg}`);
+    const ticker = Array.isArray(data.data) ? data.data[0] : null;
+    assertTrue('OKX ticker data present', !!ticker, JSON.stringify(data).slice(0, 200));
+
+    if (ticker) {
+      const bid = parseFloat(ticker.bidPx);
+      const ask = parseFloat(ticker.askPx);
+      const last = parseFloat(ticker.last);
+      console.log(`  ℹ JITOSOL-USDT bid: ${bid}, ask: ${ask}, last: ${last}`);
+      assertTrue('OKX bid is positive', bid > 0, `Got: ${bid}`);
+      assertTrue('OKX ask is positive', ask > 0, `Got: ${ask}`);
+      assertTrue('OKX bid < ask', bid < ask, `bid=${bid} ask=${ask}`);
+    }
+  }
+
+  console.log(`  URL (books): ${OKX_BOOKS_URL}`);
+  const booksResult = await fetchJson(OKX_BOOKS_URL);
+  assertTrue('OKX order book HTTP request succeeded', booksResult.ok, booksResult.error);
+
+  if (booksResult.ok && booksResult.data?.code === '0') {
+    const book = booksResult.data.data?.[0];
+    const bids = book?.bids ?? [];
+    const asks = book?.asks ?? [];
+    console.log(`  ℹ OKX depth bids: ${bids.length}, asks: ${asks.length}`);
+    assertTrue('OKX book has bids', bids.length > 0);
+    assertTrue('OKX book has asks', asks.length > 0);
+
+    if (bids.length > 0 && asks.length > 0) {
+      const topBid = parseFloat(bids[0][0]);
+      const topAsk = parseFloat(asks[0][0]);
+      assertTrue('OKX top bid < top ask', topBid < topAsk, `bid=${topBid} ask=${topAsk}`);
+    }
+  }
+}
+
+// ─── Test 5: Binance — Verify JitoSOL is NOT listed ─────────────────────────
 
 async function testBinanceClarification() {
-  section('TEST 4: Binance clarification (JTO ≠ JitoSOL)');
+  section('TEST 5: Binance clarification (JTO ≠ JitoSOL)');
   console.log('  This test documents that Binance lists the governance token JTO, not JitoSOL (staked SOL).');
 
   // JTOUSDT should exist
@@ -324,6 +372,7 @@ async function main() {
   const jitoCoef = await testJitoStats();
   await testJupiterCrossCheck(jitoCoef);
   await testCoinstoreSOL();
+  await testOkxJitosol();
   await testBinanceClarification();
 
   console.log('\n═══════════════════════════════════════════════════════════════');
