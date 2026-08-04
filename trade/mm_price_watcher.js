@@ -980,13 +980,9 @@ async function computeRangeFromSource(sourceString, isFallback = false) {
     h = h * coef;
     appliedCoefficient = coef;
     log.log(`Price watcher: Applied cross-base coefficient ${coef.toFixed(6)} (${coefResult.status ?? 'config-fallback'}) → range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2}. ${coefDescription}`);
-  } else if (utils.isPositiveNumber(+config.pw_source_coefficient)) {
-    const coef = +config.pw_source_coefficient;
-    l = l * coef;
-    h = h * coef;
-    appliedCoefficient = coef;
-    log.log(`Price watcher: Applied config pw_source_coefficient ${coef}: range ${l.toFixed(coin2Decimals)}–${h.toFixed(coin2Decimals)} ${config.coin2}.`);
   }
+  // No coefficient on a same-base source: JITOSOL/USDT@OKX already quotes the traded asset.
+  // pw_source_coefficient converts SOL→JitoSOL and must never touch a direct JitoSOL price.
 
   const preDeviationL = l;
   const preDeviationH = h;

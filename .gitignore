@@ -23,3 +23,5 @@ CLAUDE.md
 .ai-tasks/
 .firecrawl/
 tsconfig.json
+AGENTS.md
+docs/agents

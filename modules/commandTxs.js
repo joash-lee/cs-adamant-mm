@@ -757,18 +757,15 @@ async function enable(params, _, isWebApi = false) {
         }
 
         if (exchangeName.toLowerCase() === 'okx') {
-          if (!config.okx_apikey || !config.okx_apisecret || !config.okx_apipassphrase) {
-            return {
-              msgNotify: '',
-              isError: true,
-              errorField: 'source',
-              msgSendBack: 'OKX API credentials (okx_apikey, okx_apisecret, okx_apipassphrase) must be set in config.jsonc before enabling JITOSOL/USDT@OKX Price watcher.',
-              notifyType: 'log',
-            };
-          }
-
+          // The order book fetch above is the real preflight: it proves the source works.
+          // Credentials only raise rate limits, so a keyless source is allowed.
+          const hasOkxCredentials = Boolean(config.okx_apikey && config.okx_apisecret && config.okx_apipassphrase);
           const okxAuthMode = pairObj.exchangeApi.getLastAuthMode?.();
-          log.log(`Price watcher command: OKX preflight OK for ${pairObj.pair}. Auth mode: ${okxAuthMode || 'unknown'}.`);
+          const keylessNote = hasOkxCredentials ?
+              '' :
+              ' Running keyless — okx_api* not set in config.jsonc, using OKX public endpoints.';
+
+          log.log(`Price watcher command: OKX preflight OK for ${pairObj.pair}. Auth mode: ${okxAuthMode || 'unknown'}.${keylessNote}`);
         }
 
         pwSource = `${pairObj.pair}@${exchangeName}`;

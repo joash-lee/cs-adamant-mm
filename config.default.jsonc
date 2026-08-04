@@ -109,7 +109,9 @@
 
   /**
     OKX API credentials for Price Watcher external source (read-only keys recommended).
-    Required when OKX is listed in exchanges. Bot degrades to keyless public API if keys expire.
+    Optional when OKX is only a Price Watcher source — the bot reads public market data and
+    runs keyless without them, and degrades to keyless public API if working keys later expire.
+    Keys only raise rate limits. Required only when OKX is the trading exchange.
   **/
   "okx_apikey": "YOUR-OKX-KEY",
   "okx_apisecret": "YOUR-OKX-SECRET",

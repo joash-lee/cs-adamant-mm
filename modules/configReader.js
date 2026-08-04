@@ -408,12 +408,21 @@ try {
 
   if (hasOkxExchange) {
     const okxFields = ['okx_apikey', 'okx_apisecret', 'okx_apipassphrase'];
-    for (const field of okxFields) {
-      if (!config[field] || typeof config[field] !== 'string' || !config[field].trim()) {
-        exit(`Bot's config is wrong. Field _${field}_ is required when OKX is in exchanges. Cannot start Bot.`);
+    const missingOkxFields = okxFields.filter((field) =>
+      !config[field] || typeof config[field] !== 'string' || !config[field].trim());
+
+    // Credentials are mandatory only when OKX is the trading exchange — placing orders needs them.
+    // As a Price Watcher source the bot reads public market data only, so it runs keyless.
+    if (config.exchange === 'okx') {
+      if (missingOkxFields.length) {
+        exit(`Bot's config is wrong. Field _${missingOkxFields[0]}_ is required when OKX is the trading exchange. Cannot start Bot.`);
       }
+      console.info('Config reader: OKX API credentials loaded for trading and PW source connector.');
+    } else if (missingOkxFields.length) {
+      console.info(`Config reader: OKX credentials incomplete (missing ${missingOkxFields.join(', ')}). PW source will run keyless on OKX public endpoints. Set okx_api* in config.jsonc for higher rate limits.`);
+    } else {
+      console.info('Config reader: OKX API credentials loaded for PW source connector.');
     }
-    console.info('Config reader: OKX API credentials loaded for PW source connector.');
 
     if (!config.pw_fallback_source || typeof config.pw_fallback_source !== 'string' || !config.pw_fallback_source.trim()) {
       exit('Bot\'s config is wrong. Field _pw_fallback_source_ is required when OKX is in exchanges (format PAIR@Exchange). Cannot start Bot.');
