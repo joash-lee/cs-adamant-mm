@@ -1,0 +1,16 @@
+ log|[2026-06-15 03:10:01|Price watcher: Applied cross-base coefficient 1.285000 (fresh) → range 100.00–100.00 USDT. live
+ log|[2026-06-15 03:11:00|Unable to cancel order 111 on JITOSOL/USDT pair: FILLED.
+ log|[2026-06-15 03:11:00|Order collector: Unable to cancel liq-order (depth) with id=111, type=sell, targetType=undefined, pair=JITOSOL/USDT, price=101, coin1Amount=1 (1 left), coin2Amount=101. Probably it doesn't exist anymore. Marking it as processed and closed in the ordersDb.
+ log|[2026-06-15 03:11:05|Order collector: Unable to cancel liq-order (depth) with id=111, type=sell, targetType=undefined, pair=JITOSOL/USDT, price=101, coin1Amount=1 (1 left), coin2Amount=101. Probably it doesn't exist anymore. It was already marked as processed in the ordersDb.
+ log|[2026-06-15 03:11:10|Unable to cancel order 222 on JITOSOL/USDT pair: NOT_FOUND.
+ log|[2026-06-15 03:11:10|Order collector: Unable to cancel liq-order (depth) with id=222, type=buy, targetType=undefined, pair=JITOSOL/USDT, price=99, coin1Amount=1 (1 left), coin2Amount=99. Probably it doesn't exist anymore. Marking it as processed and closed in the ordersDb.
+ info|2026-06-15 03:12:00|Market-making: Successfully executed mm-order to buy 2.00 JITOSOL for 200.00 USDT at 100.00 USDT. Action: executeInOrderBook.
+ warn|2026-06-15 03:12:01|Market-making: The taker executeInOrderBook mm-order status is part_filled (0.25% filled). It may be the third-party bot intervention.
+ log|[2026-06-15 03:12:01|Order collector (run by Market-making): Clearing mm-order with id=333, type=buy, targetType=undefined, pair=JITOSOL/USDT, price=100, coin1Amount=2 (2 left), coin2Amount=200, Cancelling order1 (taker) order with status 'part_filled' while doing executeInOrderBook mm-trade.
+ log|[2026-06-15 03:12:02|Unable to cancel order 333 on JITOSOL/USDT pair: FILLED.
+ log|[2026-06-15 03:12:02|Order collector: Unable to cancel mm-order with id=333, type=buy, targetType=undefined, pair=JITOSOL/USDT, price=100, coin1Amount=2 (2 left), coin2Amount=200. Probably it doesn't exist anymore. Marking it as processed and closed in the ordersDb.
+ info|2026-06-15 03:13:00|Market-making: Successfully executed mm-order to sell 1.00 JITOSOL for 100.00 USDT at 100.00 USDT. Action: executeInOrderBook.
+ info|2026-06-15 03:13:01|Market-making: The taker executeInOrderBook mm-order is filled.
+ info|2026-06-15 03:14:00|Market-making: Successfully executed mm-order to buy 3.00 JITOSOL for 300.00 USDT at 100.00 USDT. Action: executeInOrderBook.
+ log|[2026-06-15 03:14:01|Market-making: Unable to get the executeInOrderBook taker mm-order details, probably because of Coinstore's API throttling or fault. x. Assuming it is filled.
+ log|[2026-06-15 03:20:00|Price watcher: Applied cross-base coefficient 1.285000 (fresh) → range 100.00–100.00 USDT. live

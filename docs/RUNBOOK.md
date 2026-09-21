@@ -277,8 +277,8 @@ ALERT_WEBHOOK_URL=… ALERT_WEBHOOK_SECRET=… node scripts/alert-smoke.js
 `logs/fills-YYYY-MM-DD.jsonl` (UTC day), one line per fill:
 `{ts, source, side, price, amount, quote, fair, vsFairPct}`. `source`: `liq`, `mm-taker` (MM trade into the real book),
 `mm-self` (self-trade, volume only). `vsFairPct` = how much better (+) or worse (−) than the fair price the bot traded.
-Always on; set `"fill_log_enabled": false` to stop it. For old periods without a fill log, use
-`node scripts/fill-forensics.js logs/*.log`.
+Always on; set `"fill_log_enabled": false` to stop it. For old periods without a fill log, or to answer
+"where did the money go?", use `scripts/fill-forensics.js` — see [FORENSICS.md](./FORENSICS.md).
 
 ```bash
 tail -5 logs/fills-$(date -u +%F).jsonl
