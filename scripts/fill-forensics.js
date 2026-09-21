@@ -63,6 +63,11 @@ const RE_LIQ_OPENED = /Liquidity: Opened (\d+) bids-buy .*? and (\d+) asks-sell/
 let fair = null;
 let fairTs = 0;
 
+// Running position vs the start of the log (all sources), for the trend/inventory decomposition
+let cumJ = 0;
+let cumUsdt = 0;
+const weekSnap = new Map(); // week -> { cumJ, cumUsdt, fair } at the last event of that week
+
 const weeks = new Map();
 const days = new Map();
 let firstTs = null;
@@ -105,6 +110,10 @@ function addFill(dateStr, ts, source, side, amount, price) {
 
   const fairFresh = fair && ts - fairTs <= FAIR_MAX_AGE_MS ? fair : null;
 
+  cumJ += side === 'buy' ? amount : -amount;
+  cumUsdt += side === 'buy' ? -amount * price : amount * price;
+  weekSnap.set(weekKey(dateStr), { cumJ, cumUsdt, fair });
+
   for (const b of [bucket(weeks, weekKey(dateStr)), bucket(days, dateStr)]) {
     const s = sourceBucket(b, source);
     s.fills += 1;
@@ -137,6 +146,7 @@ function handleLine(line) {
       if (f) {
         fair = (+f[1] + +f[2]) / 2;
         fairTs = ts;
+        weekSnap.set(weekKey(dateStr), { cumJ, cumUsdt, fair });
         return;
       }
     }
@@ -144,6 +154,7 @@ function handleLine(line) {
     if (sp && sp[1] === sp[2]) {
       fair = (+sp[3] + +sp[4]) / 2;
       fairTs = ts;
+      weekSnap.set(weekKey(dateStr), { cumJ, cumUsdt, fair });
     }
     return;
   }
@@ -238,6 +249,15 @@ function printWeeks() {
   console.log(`${pad('ALL', 10)}: JITOSOL ${allJ >= 0 ? '+' : ''}${fmt(allJ, 2)}, USDT ${allUsdt >= 0 ? '+' : ''}${fmt(allUsdt)}, edge vs fair ${fmt(allEdge)} USDT`);
   console.log(`mm executeInSpread self-trade volume: ${fmt(totalSpreadVol)} USDT (each is maker + taker on your own account)`);
 
+  if (fair) {
+    const vsHold = allUsdt + allJ * fair;
+    console.log(`\n── Where the value went (vs simply holding, marked at last fair ${fmt(fair, 2)}) ──`);
+    console.log(`Total trading result vs holding: ${fmt(vsHold)} USDT`);
+    console.log(`  of which edge vs fair (picked off / crossing the book): ${fmt(allEdge)} USDT`);
+    console.log(`  of which inventory/trend (holding less or more JITOSOL while its price moved): ${fmt(vsHold - allEdge)} USDT`);
+    console.log('  (fees and transfers are not in the logs and are NOT included above)');
+  }
+
   if (feePercent !== null) {
     const feeNotional = allNotional + 2 * totalSpreadVol;
     console.log(`Fee estimate at ${feePercent}% per side: ${fmt(feeNotional * feePercent / 100)} USDT on ${fmt(feeNotional)} USDT fee-bearing notional`);
@@ -251,6 +271,15 @@ function printLiqHealth() {
   for (const [week, b] of [...weeks.entries()].sort()) {
     if (!b.liqCycles) continue;
     console.log(`${week}: ${fmt(b.liqCycles)} cycles, 0 bids in ${fmt(b.liqZeroBidCycles)} (${fmt(100 * b.liqZeroBidCycles / b.liqCycles)}%), 0 asks in ${fmt(b.liqZeroAskCycles)} (${fmt(100 * b.liqZeroAskCycles / b.liqCycles)}%)`);
+  }
+}
+
+function printPosition() {
+  console.log('\n── Position drift vs log start (end of each week) ──');
+  console.log('How the balances became one-sided: negative JITOSOL = bot net-sold JITOSOL, negative USDT = bot net-spent USDT.');
+  for (const [week, s] of [...weekSnap.entries()].sort()) {
+    const vsHold = s.fair ? fmt(s.cumUsdt + s.cumJ * s.fair) : '-';
+    console.log(`${week}: JITOSOL ${s.cumJ >= 0 ? '+' : ''}${fmt(s.cumJ, 2)}, USDT ${s.cumUsdt >= 0 ? '+' : ''}${fmt(s.cumUsdt)}, fair ${s.fair ? fmt(s.fair, 2) : '-'}, result vs holding ${vsHold} USDT`);
   }
 }
 
@@ -275,6 +304,7 @@ function printWorstDays() {
   }
   console.log(`Log span: ${firstTs} → ${lastTs} (UTC)\n`);
   printWeeks();
+  printPosition();
   printLiqHealth();
   printWorstDays();
 })();
