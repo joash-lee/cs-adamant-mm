@@ -23,9 +23,15 @@
  *
  * Fills recognised:
  *   - "It's partly filled …: A -> B"                          partial fill of a resting order
- *   - "Unable to cancel …. Probably it doesn't exist anymore"  resting order vanished → assumed fully filled
- *   - "Successfully executed mm-order … executeInOrderBook"    mm taker trade into the real book (assumed filled)
+ *   - "Unable to cancel …. Probably it doesn't exist anymore"  resting order vanished; counted only when the exchange's
+ *                                                              preceding cancel reply said FILLED (once per order id)
+ *   - "Successfully executed mm-order … executeInOrderBook"    mm taker trade into the real book; the filled amount comes
+ *                                                              from the bot's follow-up status line (filled / part_filled
+ *                                                              X% / new / cancelled), plus any remainder later found FILLED
  *   - "Successfully executed mm-order … executeInSpread"       mm self-trade: volume only, nets to zero except fees
+ *
+ * Anything the logs cannot confirm (e.g. "Assuming it is filled", PARTIAL_FILLED on cancel) is reported
+ * separately as UNCONFIRMED and kept out of the main numbers.
  *
  * Fair price = midpoint of the latest post-coefficient, pre-deviation Pw range in the log.
  *
@@ -80,7 +86,13 @@ const hasEnd = Number.isFinite(opts.endQuote) && Number.isFinite(opts.endBase);
 const RE_LINE = /^\s*\w+\|\[?(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\|(.*)$/;
 
 const RE_PARTIAL = /Updating (\w+)-order.*?type=(buy|sell), pair=(\S+?),.*?price=([\d.]+).*?It's partly filled [^:]*: ([\d.e-]+) -> ([\d.e-]+) /;
-const RE_VANISHED = /Unable to cancel (\w+)-order.*?type=(buy|sell),.*?pair=(\S+?), price=([\d.]+), coin1Amount=[\d.e-]+ \(([\d.e-]+) left\).*Probably it doesn't exist anymore/;
+const RE_VANISHED = /Unable to cancel (\w+)-order.*? id=(\w+), type=(buy|sell),.*?pair=(\S+?), price=([\d.]+), coin1Amount=[\d.e-]+ \(([\d.e-]+) left\).*Probably it doesn't exist anymore/;
+// Exchange connector's reply to a cancel, logged just before the Order collector line above
+const RE_CANCEL_REPLY = /^Unable to cancel order (\w+) on \S+ pair: (.+?)\.?$/;
+const RE_ALREADY_CANCELLED = /^Order (\w+) on \S+ pair is already cancelled/;
+// mm_trader's follow-up status check for an executeInOrderBook taker order
+const RE_MM_STATUS = /taker executeInOrderBook mm-order (?:is (filled|cancelled)|status is (\w+) \(([\d.e-]+)% filled\))/;
+const RE_MM_CLEAR = /Clearing mm-order.*? id=(\w+),.*while doing executeInOrderBook/;
 const RE_MM = /Successfully executed mm-order.*? to (buy|sell) ([\d.]+) (\w+) for ([\d.]+) (\w+) at ([\d.]+) \w+\. Action: (executeInOrderBook|executeInSpread)/;
 
 const RE_FAIR = [
@@ -109,6 +121,13 @@ const pendingMarkouts = []; // fills waiting for the fair price MARKOUT_MS later
 const weeks = new Map();
 const days = new Map();
 const daySnap = new Map(); // day -> { cumBase, cumQuote, fair } at the last event of that day
+const cancelReplies = new Map(); // order id -> exchange's reply to the last cancel attempt
+const countedVanished = new Set(); // order ids already counted as vanished-filled
+const mmRemainders = new Map(); // mm taker order id -> unfilled remainder awaiting its cancel result
+let mmPending = null; // last executeInOrderBook trade waiting for its status line
+let mmLastPartial = null; // last partly/unfilled taker trade waiting for its Clearing line
+const unconfirmed = {}; // source -> { buyBase, buyQuote, sellBase, sellQuote, count }
+const quality = {}; // label -> count, for the data-quality section
 const zeroBidDays = new Set();
 const zeroAskDays = new Set();
 let firstTs = null;
@@ -170,6 +189,35 @@ function setFair(value, ts, day) {
   }
 
   if (inRange(day)) snapDay(day);
+}
+
+function tally(label) {
+  quality[label] = (quality[label] || 0) + 1;
+}
+
+function addUnconfirmed(day, source, side, amount, price, reason) {
+  tally(`unconfirmed: ${reason}`);
+  if (!(amount > 0) || !(price > 0) || !inRange(day)) return;
+  if (!unconfirmed[source]) unconfirmed[source] = { buyBase: 0, buyQuote: 0, sellBase: 0, sellQuote: 0, count: 0 };
+  const u = unconfirmed[source];
+  u.count += 1;
+  if (side === 'buy') {
+    u.buyBase += amount;
+    u.buyQuote += amount * price;
+  } else {
+    u.sellBase += amount;
+    u.sellQuote += amount * price;
+  }
+}
+
+function resolveMmPending(day, fraction, label) {
+  const t = mmPending;
+  mmPending = null;
+  if (!t) return;
+  tally(`mm-book status: ${label}`);
+  const filled = t.amount * Math.min(Math.max(fraction, 0), 1);
+  if (filled > 0) addFill(t.day, t.time, t.ts, 'mm-book', t.side, filled, t.price);
+  mmLastPartial = filled < t.amount ? { ...t, amount: t.amount - filled } : null;
 }
 
 function addFill(day, time, ts, source, side, amount, price) {
@@ -245,11 +293,71 @@ function handleLine(line) {
     return;
   }
 
+  if (msg.startsWith('Unable to cancel order ')) {
+    const r = RE_CANCEL_REPLY.exec(msg);
+    if (r) cancelReplies.set(r[1], r[2].trim());
+    return;
+  }
+
+  if (msg.startsWith('Order ') && msg.includes('is already cancelled')) {
+    const r = RE_ALREADY_CANCELLED.exec(msg);
+    if (r) cancelReplies.set(r[1], 'already cancelled');
+    return;
+  }
+
   if (msg.includes('Probably it doesn\'t exist anymore')) {
     const v = RE_VANISHED.exec(msg);
-    if (v) {
-      notePair(v[3]);
-      addFill(day, time, ts, v[1], v[2], +v[5], +v[4]);
+    if (!v) return;
+    const [, purpose, id, side, pair, price, left] = v;
+    notePair(pair);
+    const reply = cancelReplies.get(id) || 'no reply logged';
+    cancelReplies.delete(id);
+
+    if (msg.includes('It was already marked as processed') || countedVanished.has(id)) {
+      tally('vanished: duplicate line, skipped');
+      return;
+    }
+    countedVanished.add(id);
+
+    const remainder = mmRemainders.get(id);
+    mmRemainders.delete(id);
+
+    if (reply === 'FILLED') {
+      tally(`vanished ${remainder ? 'mm-book remainder' : purpose}: FILLED`);
+      if (remainder) addFill(day, time, ts, 'mm-book', remainder.side, remainder.amount, remainder.price);
+      else addFill(day, time, ts, purpose, side, +left, +price);
+    } else if (reply === 'PARTIAL_FILLED' || reply === 'no reply logged') {
+      const r = remainder || { side, amount: +left, price: +price };
+      addUnconfirmed(day, remainder ? 'mm-book' : purpose, r.side, r.amount, r.price, `vanished, ${reply}`);
+    } else {
+      tally(`vanished, not a fill: ${reply.replace(/\d{6,}/g, 'N')}`);
+    }
+    return;
+  }
+
+  if (msg.startsWith('Market-making:') && msg.includes('Assuming') && msg.includes('executeInOrderBook')) {
+    if (mmPending) {
+      const t = mmPending;
+      mmPending = null;
+      addUnconfirmed(t.day, 'mm-book', t.side, t.amount, t.price, 'mm-book status unknown, bot assumed filled');
+    }
+    return;
+  }
+
+  if (msg.includes('taker executeInOrderBook mm-order')) {
+    const st = RE_MM_STATUS.exec(msg);
+    if (st && st[1] === 'filled') resolveMmPending(day, 1, 'filled');
+    else if (st && st[1] === 'cancelled') resolveMmPending(day, 0, 'cancelled');
+    else if (st) resolveMmPending(day, +st[3] > 1 ? +st[3] / 100 : +st[3], st[2]);
+    return;
+  }
+
+  if (msg.includes('Clearing mm-order') && mmLastPartial) {
+    const c = RE_MM_CLEAR.exec(msg);
+    if (c) {
+      mmRemainders.set(c[1], mmLastPartial);
+      mmLastPartial = null;
+      if (mmRemainders.size > 10000) mmRemainders.delete(mmRemainders.keys().next().value);
     }
     return;
   }
@@ -260,7 +368,8 @@ function handleLine(line) {
     const [, side, amount, coin1, quote, coin2, price, action] = e;
     notePair(`${coin1}/${coin2}`);
     if (action === 'executeInOrderBook') {
-      addFill(day, time, ts, 'mm-book', side, +amount, +price);
+      if (mmPending) addUnconfirmed(mmPending.day, 'mm-book', mmPending.side, mmPending.amount, mmPending.price, 'mm-book no status line');
+      mmPending = { day, time, ts, side, amount: +amount, price: +price };
     } else if (inRange(day)) {
       period(weeks, weekKey(day)).selfTradeQuote += +quote;
       period(days, day).selfTradeQuote += +quote;
@@ -398,11 +507,22 @@ function printSummary(totals, selfTrade) {
   if (firstZeroBid) console.log(`Liq first placed 0 bids on ${firstZeroBid} (${zeroBidDays.size} days with at least one 0-bid cycle).`);
   if (firstZeroAsk) console.log(`Liq first placed 0 asks on ${firstZeroAsk} (${zeroAskDays.size} days with at least one 0-ask cycle).`);
 
+  let uBase = 0; let uQuote = 0;
+  for (const u of Object.values(unconfirmed)) {
+    uBase += u.buyBase - u.sellBase;
+    uQuote += u.sellQuote - u.buyQuote;
+  }
+
   if (hasStart && hasEnd) {
     const expQuote = opts.startQuote + cumQuote;
     const expBase = opts.startBase + cumBase;
-    console.log(`Reconciliation: fills explain ${fmt(expQuote)} ${quoteCoin} + ${fmt(expBase, 2)} ${baseCoin}; actual ${fmt(opts.endQuote)} + ${fmt(opts.endBase, 2)}.`);
-    console.log(`  Unexplained: ${signed(opts.endQuote - expQuote)} ${quoteCoin}, ${signed(opts.endBase - expBase, 2)} ${baseCoin} (= fees + transfers + fills the logs missed).`);
+    console.log(`Reconciliation (the trust check): confirmed fills explain ${fmt(expQuote)} ${quoteCoin} + ${fmt(expBase, 2)} ${baseCoin}; actual ${fmt(opts.endQuote)} + ${fmt(opts.endBase, 2)}.`);
+    console.log(`  Unexplained: ${signed(opts.endQuote - expQuote)} ${quoteCoin}, ${signed(opts.endBase - expBase, 2)} ${baseCoin} (= fees + transfers + unconfirmed/missed fills).`);
+    console.log(`  If all UNCONFIRMED fills were real: unexplained ${signed(opts.endQuote - expQuote - uQuote)} ${quoteCoin}, ${signed(opts.endBase - expBase - uBase, 2)} ${baseCoin}.`);
+    const ok = Math.abs(opts.endBase - expBase) <= 0.1 * Math.max(opts.startBase, opts.endBase, 1);
+    console.log(ok ?
+      '  → Coin balance reconciles within 10%: the fill reconstruction is broadly trustworthy.' :
+      '  → Coin balance does NOT reconcile: treat the numbers above as unreliable and check the data-quality section.');
   }
 }
 
@@ -420,6 +540,16 @@ function printSources(totals, selfTrade) {
     ], w));
   }
   console.log(`spread% = avg sell vs avg buy (negative = bought higher than sold). Self-trade volume: ${fmt(selfTrade)} ${quoteCoin}.`);
+}
+
+function printQuality() {
+  section('DATA QUALITY (how each fill signal was classified)');
+  for (const [label, n] of Object.entries(quality).sort((a, b) => b[1] - a[1])) {
+    console.log(`${pad(fmt(n), 9)}  ${label}`);
+  }
+  for (const [src, u] of Object.entries(unconfirmed)) {
+    console.log(`UNCONFIRMED ${src}: ${fmt(u.count)} fills, bought ${fmt(u.buyBase, 2)} / sold ${fmt(u.sellBase, 2)} ${baseCoin} (${fmt(u.buyQuote + u.sellQuote)} ${quoteCoin}) — not in the numbers above`);
+  }
 }
 
 function printWeekly() {
@@ -491,6 +621,7 @@ function printWorstDays() {
   const { totals, selfTrade } = sumSources(weeks);
   printSummary(totals, selfTrade);
   printSources(totals, selfTrade);
+  printQuality();
   printWeekly();
   printBalanceCurve();
   printWorstDays();
