@@ -545,10 +545,21 @@ function printSummary(totals, selfTrade) {
     console.log(`Reconciliation (the trust check): confirmed fills explain ${fmt(expQuote)} ${quoteCoin} + ${fmt(expBase, 2)} ${baseCoin}; actual ${fmt(opts.endQuote)} + ${fmt(opts.endBase, 2)}.`);
     console.log(`  Unexplained: ${signed(opts.endQuote - expQuote)} ${quoteCoin}, ${signed(opts.endBase - expBase, 2)} ${baseCoin} (= fees + transfers + unconfirmed/missed fills).`);
     console.log(`  If all UNCONFIRMED fills were real: unexplained ${signed(opts.endQuote - expQuote - uQuote)} ${quoteCoin}, ${signed(opts.endBase - expBase - uBase, 2)} ${baseCoin}.`);
-    const ok = Math.abs(opts.endBase - expBase) <= 0.1 * Math.max(opts.startBase, opts.endBase, 1);
-    console.log(ok ?
-      '  → Coin balance reconciles within 10%: the fill reconstruction is broadly trustworthy.' :
-      '  → Coin balance does NOT reconcile: treat the numbers above as unreliable and check the data-quality section.');
+    if (fair) {
+      const valueGap = (opts.endQuote - expQuote) + (opts.endBase - expBase) * fair;
+      const startValue = opts.startQuote + opts.startBase * fair;
+      const valueOk = Math.abs(valueGap) <= 0.05 * startValue;
+      const coinsOk = Math.abs(opts.endBase - expBase) <= 0.1 * Math.max(opts.startBase, opts.endBase, 1);
+      console.log(`  Value gap at fair ${fmt(fair, 2)}: ${signed(valueGap)} ${quoteCoin} (${fmt(100 * valueGap / startValue, 1)}% of start value).`);
+      if (valueOk && coinsOk) {
+        console.log('  → Value and coin balances reconcile: the reconstruction is trustworthy.');
+      } else if (valueOk) {
+        console.log('  → Total VALUE reconciles, so the result-vs-holding and edge numbers are trustworthy (no hidden fees/transfers of size).');
+        console.log('    The coin SPLIT does not: some fills are mis-dated or mis-sided, so read the weekly position/balance path loosely.');
+      } else {
+        console.log('  → Value does NOT reconcile: fees, transfers or missed fills of real size exist — treat totals with caution.');
+      }
+    }
   }
 }
 
