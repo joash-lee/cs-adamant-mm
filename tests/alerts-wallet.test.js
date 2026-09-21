@@ -156,11 +156,13 @@ describe('wallet_fast', () => {
     jest.advanceTimersByTime(10 * MINUTE);
     alerts.evaluateWallet(sample(66));
 
+    const fast = () => events(sent).filter((e) => e.endsWith(':wallet_fast'));
+
     jest.advanceTimersByTime(59 * MINUTE);
-    expect(events(sent)).toEqual(['raise:wallet_fast']);
+    expect(fast()).toEqual(['raise:wallet_fast']);
 
     jest.advanceTimersByTime(MINUTE);
-    expect(events(sent)).toEqual(['raise:wallet_fast', 'clear:wallet_fast']);
+    expect(fast()).toEqual(['raise:wallet_fast', 'clear:wallet_fast']);
     alerts.stop();
   });
 });

@@ -29,6 +29,8 @@ const ALERT_DEFAULTS = {
   alert_wallet_fast_move_pts: 15,
   alert_wallet_fast_window_min: 60,
   alert_empty_side_cycles: 5,
+  alert_no_orders_min: 10,
+  alert_no_trades_min: 30,
 };
 
 /**
@@ -56,6 +58,8 @@ function parseAlertConfig(config = {}) {
     walletFastPts: num('alert_wallet_fast_move_pts'),
     walletFastWindowMs: num('alert_wallet_fast_window_min') * MINUTE,
     emptySideCycles: num('alert_empty_side_cycles'),
+    noOrdersMs: num('alert_no_orders_min') * MINUTE,
+    noTradesMs: num('alert_no_trades_min') * MINUTE,
   };
 }
 
@@ -65,7 +69,7 @@ function parseAlertConfig(config = {}) {
  * @param {Object} deps.config Bot's config
  * @param {Object} deps.log Logger with log/warn
  * @param {Function} [deps.post] (url, payload, options) => Promise. Defaults to axios.post
- * @param {Function} [deps.getStatus] () => { mmActive, liqActive, pwActive }
+ * @param {Function} [deps.getStatus] () => { mmActive, liqActive, pwActive, tradesExpected }
  * @param {Function} [deps.getFairMid] () => number | null
  * @param {Function} [deps.getBalances] async () => { base, quote } | null, free + locked amounts
  * @return {Object} Alerts instance
@@ -97,6 +101,13 @@ function createAlerts(deps) {
     lastTradeTs: null,
     walletShareQuote: null,
     ordersSeenTs: null, // Last liq cycle with at least one order open
+  };
+
+  // Stopped-trading checks: since when MM and liq are active (null = inactive)
+  const activity = {
+    mmActiveSince: null,
+    liqActiveSince: null,
+    lastMmActiveTs: null,
   };
 
   // Wallet alerts
@@ -346,6 +357,70 @@ function createAlerts(deps) {
     }
   }
 
+  /**
+   * Evaluates paused, no_orders and no_trades. Runs in the tick, so a stuck liq loop is still caught.
+   * @param {Object} status getStatus() result
+   */
+  function evaluateActivity(status) {
+    const now = Date.now();
+
+    if (!status.mmActive) {
+      // Paused: only the paused info, sent once. Forget the other stopped-trading alerts without a clear message
+      activity.mmActiveSince = null;
+      activity.liqActiveSince = null;
+      drop('no_orders');
+      drop('no_trades');
+      raise('paused', {}, { remind: false });
+      return;
+    }
+
+    activity.lastMmActiveTs = now;
+    if (activity.mmActiveSince === null) {
+      activity.mmActiveSince = now;
+    }
+
+    clear('paused', {}); // ▶️ resumed
+
+    // no_trades: MM active (and expected to trade), no mm execution or fill for N minutes
+
+    if (status.tradesExpected !== false) {
+      const tradeRefTs = Math.max(state.lastTradeTs || 0, activity.mmActiveSince);
+      const minutesWithoutTrades = (now - tradeRefTs) / MINUTE;
+
+      if (now - tradeRefTs >= settings.noTradesMs) {
+        raise('no_trades', { minutes: Math.round(minutesWithoutTrades), lastTradeTs: state.lastTradeTs });
+      } else {
+        clear('no_trades', {});
+      }
+    } else {
+      drop('no_trades');
+    }
+
+    // no_orders: liq active, and no liq cycle with orders open for N minutes (covers a stuck liq loop)
+
+    if (status.liqActive) {
+      if (activity.liqActiveSince === null) {
+        activity.liqActiveSince = now;
+      }
+
+      const ordersRefTs = Math.max(state.ordersSeenTs || 0, activity.liqActiveSince);
+
+      if (now - ordersRefTs >= settings.noOrdersMs) {
+        raise('no_orders', {
+          minutes: Math.round((now - ordersRefTs) / MINUTE),
+          bidsOpen: state.bidsOpen,
+          asksOpen: state.asksOpen,
+          lastLiqCycleMinAgo: state.lastLiqCycleTs ? Math.round((now - state.lastLiqCycleTs) / MINUTE) : null,
+        });
+      } else {
+        clear('no_orders', { bidsOpen: state.bidsOpen, asksOpen: state.asksOpen });
+      }
+    } else {
+      activity.liqActiveSince = null;
+      drop('no_orders');
+    }
+  }
+
   function heartbeatPayload() {
     const status = getStatus();
     const fairMid = getFairMid();
@@ -379,6 +454,8 @@ function createAlerts(deps) {
     try {
       const now = Date.now();
 
+      evaluateActivity(getStatus());
+
       if (active.has('wallet_fast') && now - wallet.lastFastMoveTs >= settings.walletFastWindowMs) {
         clear('wallet_fast', {});
       }
@@ -392,6 +469,7 @@ function createAlerts(deps) {
   return {
     settings,
     state,
+    activity,
     active,
     raiseCounts,
 
@@ -418,6 +496,7 @@ function createAlerts(deps) {
       log.log(`Bot alerts: Started. Sending events to ${host}, heartbeat every ${settings.heartbeatMs / MINUTE} min.`);
 
       sendHeartbeat();
+      tick(); // Starts the stopped-trading clocks now, and reports paused right away
       heartbeatTimer = setInterval(sendHeartbeat, settings.heartbeatMs);
       tickTimer = setInterval(tick, TICK_INTERVAL_MS);
 
@@ -505,6 +584,7 @@ function getInstance() {
               !config.perpetual,
           ),
           pwActive: Boolean(tradeParams.mm_isPriceWatcherActive),
+          tradesExpected: tradeParams.mm_Policy !== 'depth', // depth policy doesn't create volume
         };
       },
       getFairMid() {

@@ -88,27 +88,27 @@ describe('raise / clear / reminder', () => {
 
   it('sends a reminder every alert_reminder_hours while raised', () => {
     const { alerts, sent } = makeAlerts({ config: { alert_reminder_hours: 6 } });
+    const backup = () => sent().filter((e) => e.key === 'backup_price');
     alerts.start();
     alerts.raise('backup_price', { x: 1 });
 
     jest.advanceTimersByTime(6 * HOUR - MINUTE);
-    expect(sent().map((e) => e.kind)).toEqual(['raise']);
+    expect(backup().map((e) => e.kind)).toEqual(['raise']);
 
     jest.advanceTimersByTime(MINUTE);
-    expect(sent().map((e) => e.kind)).toEqual(['raise', 'reminder']);
-    expect(sent()[1].data).toMatchObject({ x: 1, raisedMinAgo: 360 });
+    expect(backup().map((e) => e.kind)).toEqual(['raise', 'reminder']);
+    expect(backup()[1].data).toMatchObject({ x: 1, raisedMinAgo: 360 });
 
     jest.advanceTimersByTime(6 * HOUR);
-    expect(sent().map((e) => e.kind)).toEqual(['raise', 'reminder', 'reminder']);
+    expect(backup().map((e) => e.kind)).toEqual(['raise', 'reminder', 'reminder']);
     alerts.stop();
   });
 
   it('sends no reminders for keys raised with remind: false', () => {
-    const { alerts, sent } = makeAlerts();
-    alerts.start();
-    alerts.raise('paused', {}, { remind: false });
+    const { alerts, sent } = makeAlerts({ status: { mmActive: false } });
+    alerts.start(); // MM paused: raises 'paused' without reminders
     jest.advanceTimersByTime(24 * HOUR);
-    expect(sent().map((e) => e.kind)).toEqual(['raise']);
+    expect(sent().map((e) => `${e.kind}:${e.key}`)).toEqual(['raise:paused']);
     alerts.stop();
   });
 
