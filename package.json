@@ -75,5 +75,12 @@
   "bugs": {
     "url": "https://github.com/Adamant-im/adamant-tradebot/issues"
   },
-  "homepage": "https://marketmaking.app"
+  "homepage": "https://marketmaking.app",
+  "jest": {
+    "testMatch": [
+      "**/tests/**/alerts-*.test.js",
+      "**/tests/**/fill-*.test.js"
+    ],
+    "transform": {}
+  }
 }

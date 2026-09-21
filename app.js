@@ -57,6 +57,8 @@ function startModules() {
       require('./trade/mm_liquidity_provider').run();
       require('./trade/mm_price_watcher').run();
 
+      require('./helpers/botAlerts').start(); // Telegram alerts via n8n; off when alert_webhook_url is not set
+
       if (config.dev) {
         require('./trade/tests/manual.test').run();
       }

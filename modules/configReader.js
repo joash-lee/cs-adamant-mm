@@ -239,6 +239,23 @@ const fields = {
     type: Boolean,
     default: false,
   },
+  // Bot alerts (helpers/botAlerts.js). Defaults are applied there; missing alert_webhook_url = alerts off
+  alert_webhook_url: {
+    type: String,
+    isRequired: false,
+  },
+  alert_webhook_secret: {
+    type: String,
+    isRequired: false,
+  },
+  alert_heartbeat_min: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_reminder_hours: {
+    type: Number,
+    isRequired: false,
+  },
 };
 
 try {
