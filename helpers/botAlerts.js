@@ -15,6 +15,7 @@
 
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 
 const SEND_TIMEOUT_MS = 5000;
 const TICK_INTERVAL_MS = MINUTE;
@@ -34,6 +35,8 @@ const ALERT_DEFAULTS = {
   alert_no_trades_min: 30,
   alert_429_count: 30,
   alert_trouble_clear_min: 30,
+  alert_daily_utc_hour: 1,
+  alert_bad_fills_pct: 1,
 };
 
 /**
@@ -65,6 +68,8 @@ function parseAlertConfig(config = {}) {
     noTradesMs: num('alert_no_trades_min') * MINUTE,
     count429: num('alert_429_count'),
     troubleClearMs: num('alert_trouble_clear_min') * MINUTE,
+    dailyUtcHour: num('alert_daily_utc_hour') % 24,
+    badFillsPct: num('alert_bad_fills_pct'),
   };
 }
 
@@ -77,6 +82,7 @@ function parseAlertConfig(config = {}) {
  * @param {Function} [deps.getStatus] () => { mmActive, liqActive, pwActive, tradesExpected }
  * @param {Function} [deps.getFairMid] () => number | null
  * @param {Function} [deps.getBalances] async () => { base, quote } | null, free + locked amounts
+ * @param {Function} [deps.readFills] (sinceTs, nowTs) => Array of fill lines (helpers/fillLog.js)
  * @return {Object} Alerts instance
  */
 function createAlerts(deps) {
@@ -86,6 +92,7 @@ function createAlerts(deps) {
   const getStatus = deps.getStatus || (() => ({ mmActive: false, liqActive: false, pwActive: false }));
   const getFairMid = deps.getFairMid || (() => null);
   const getBalances = deps.getBalances || (async () => null);
+  const readFills = deps.readFills || (() => []);
 
   const startedAt = Date.now();
 
@@ -113,6 +120,11 @@ function createAlerts(deps) {
     mmActiveSince: null,
     liqActiveSince: null,
     lastMmActiveTs: null,
+  };
+
+  // Daily report
+  const daily = {
+    lastSentDay: null, // UTC date of the last report, guards against double sends
   };
 
   // exchange_trouble
@@ -450,6 +462,52 @@ function createAlerts(deps) {
     }
   }
 
+  /**
+   * Builds and sends the daily report: last 24 h of the fill log, one balance read, alert counts
+   */
+  async function sendDaily() {
+    const now = Date.now();
+
+    // Take the counts first, so raises during the awaits below go to the next report
+    const alertCounts = {};
+    for (const [key, count] of raiseCounts) {
+      if (key !== 'paused') alertCounts[key] = count; // paused is info, reported as the paused flag
+    }
+    raiseCounts.clear();
+
+    const status = getStatus();
+    const paused = !status.mmActive && (activity.lastMmActiveTs === null || now - activity.lastMmActiveTs >= DAY);
+
+    let fills = [];
+    try {
+      fills = readFills(now - DAY, now) || [];
+    } catch (e) {
+      log.warn(`Bot alerts: Unable to read the fill log for the daily report: ${e}.`);
+    }
+
+    let balances = null;
+    try {
+      balances = await getBalances();
+    } catch (e) {
+      log.warn(`Bot alerts: Unable to read balances for the daily report: ${e}.`);
+    }
+
+    send('daily', 'daily', buildDailyReport({ fills, balances, alertCounts, paused, badFillsPct: settings.badFillsPct }));
+  }
+
+  /**
+   * Sends the daily report once per UTC day, in the alert_daily_utc_hour hour
+   */
+  function checkDaily() {
+    const now = new Date();
+    const day = now.toISOString().slice(0, 10);
+
+    if (now.getUTCHours() === settings.dailyUtcHour && daily.lastSentDay !== day) {
+      daily.lastSentDay = day;
+      sendDaily().catch((e) => log.warn(`Bot alerts: Unable to send the daily report: ${e}.`));
+    }
+  }
+
   function heartbeatPayload() {
     const status = getStatus();
     const fairMid = getFairMid();
@@ -495,6 +553,7 @@ function createAlerts(deps) {
       }
 
       sendReminders();
+      checkDaily();
     } catch (e) {
       log.warn(`Bot alerts: Error in the evaluator tick: ${e}.`);
     }
@@ -552,6 +611,7 @@ function createAlerts(deps) {
     evaluateWallet,
     checkWallet,
     reportExchangeTrouble,
+    sendDaily,
 
     /**
      * Records an HTTP 429 (rate limit) response from the exchange
@@ -607,6 +667,32 @@ function createAlerts(deps) {
   };
 }
 
+/**
+ * Builds the daily report data (numbers only; n8n writes the words)
+ * @param {Object} params
+ * @param {Array<Object>} params.fills Fill lines of the last 24 h
+ * @param {Object|null} params.balances { base, quote }, free + locked
+ * @param {Object} params.alertCounts Raises per key
+ * @param {boolean} params.paused MM paused all day
+ * @param {number} params.badFillsPct Warn when the average vs fair is worse than −this
+ * @return {Object}
+ */
+function buildDailyReport({ fills, balances, alertCounts, paused, badFillsPct }) {
+  const { summarizeFills } = require('./fillLog');
+  const summary = summarizeFills(fills, badFillsPct);
+  const alertsTotal = Object.values(alertCounts).reduce((sum, count) => sum + count, 0);
+
+  return {
+    ...summary, // trades, selfTrades, selfTradeQuote, tradeQuote, avgVsFairPct, badFills
+    badFillsPct,
+    baseAmount: balances ? +balances.base : null,
+    quoteAmount: balances ? +balances.quote : null,
+    alerts: alertCounts,
+    alertsTotal,
+    paused: Boolean(paused),
+  };
+}
+
 let instance;
 
 /**
@@ -655,6 +741,10 @@ function getInstance() {
 
         return { base: amount(config.coin1), quote: amount(config.coin2) };
       },
+      readFills(sinceTs, nowTs) {
+        const path = require('path');
+        return require('./fillLog').readFillsSince(path.resolve('./logs'), sinceTs, nowTs); // Same folder as helpers/log.js
+      },
     });
   }
 
@@ -684,6 +774,7 @@ module.exports = {
   ALERT_DEFAULTS,
   parseAlertConfig,
   createAlerts,
+  buildDailyReport,
   getInstance,
 
   start: safeHook('start'),

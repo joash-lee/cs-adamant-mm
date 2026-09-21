@@ -296,6 +296,14 @@ const fields = {
     type: Number,
     isRequired: false,
   },
+  alert_daily_utc_hour: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_bad_fills_pct: {
+    type: Number,
+    isRequired: false,
+  },
   // Fill log (helpers/fillLog.js), on unless false. No default here: a Boolean default would override an explicit false
   fill_log_enabled: {
     type: Boolean,

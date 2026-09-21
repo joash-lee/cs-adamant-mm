@@ -1,0 +1,6 @@
+{"ts":1789956000000,"source":"liq","side":"buy","price":199,"amount":1,"quote":199,"fair":200,"vsFairPct":0.5}
+{"ts":1789959600000,"source":"liq","side":"sell","price":198,"amount":1,"quote":198,"fair":200,"vsFairPct":-1}
+{"ts":1789963200000,"source":"mm-taker","side":"sell","price":197,"amount":2,"quote":394,"fair":200,"vsFairPct":-1.5}
+{"ts":1789966800000,"source":"mm-self","side":"buy","price":200,"amount":5,"quote":1000,"fair":200,"vsFairPct":0}
+{"ts":1789970400000,"source":"mm-self","side":"sell","price":200,"amount":5,"quote":1000,"fair":200,"vsFairPct":0}
+{"ts":1789974000000,"source":"liq","side":"buy","price":201,"amount":1,"quote":201,"fair":null,"vsFairPct":null}
