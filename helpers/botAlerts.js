@@ -18,10 +18,17 @@ const HOUR = 60 * MINUTE;
 
 const SEND_TIMEOUT_MS = 5000;
 const TICK_INTERVAL_MS = MINUTE;
+const WALLET_CHECK_INTERVAL_MS = MINUTE; // Balance reads for wallet alerts, at most once a minute
 
 const ALERT_DEFAULTS = {
   alert_heartbeat_min: 10,
   alert_reminder_hours: 6,
+  alert_wallet_warn_pct: 30,
+  alert_wallet_serious_pct: 15,
+  alert_wallet_clear_pct: 35,
+  alert_wallet_fast_move_pts: 15,
+  alert_wallet_fast_window_min: 60,
+  alert_empty_side_cycles: 5,
 };
 
 /**
@@ -43,6 +50,12 @@ function parseAlertConfig(config = {}) {
     secret: typeof config.alert_webhook_secret === 'string' ? config.alert_webhook_secret : '',
     heartbeatMs: num('alert_heartbeat_min') * MINUTE,
     reminderMs: num('alert_reminder_hours') * HOUR,
+    walletWarnPct: num('alert_wallet_warn_pct'),
+    walletSeriousPct: num('alert_wallet_serious_pct'),
+    walletClearPct: num('alert_wallet_clear_pct'),
+    walletFastPts: num('alert_wallet_fast_move_pts'),
+    walletFastWindowMs: num('alert_wallet_fast_window_min') * MINUTE,
+    emptySideCycles: num('alert_empty_side_cycles'),
   };
 }
 
@@ -54,6 +67,7 @@ function parseAlertConfig(config = {}) {
  * @param {Function} [deps.post] (url, payload, options) => Promise. Defaults to axios.post
  * @param {Function} [deps.getStatus] () => { mmActive, liqActive, pwActive }
  * @param {Function} [deps.getFairMid] () => number | null
+ * @param {Function} [deps.getBalances] async () => { base, quote } | null, free + locked amounts
  * @return {Object} Alerts instance
  */
 function createAlerts(deps) {
@@ -62,6 +76,7 @@ function createAlerts(deps) {
   const post = deps.post || ((url, payload, options) => require('axios').post(url, payload, options));
   const getStatus = deps.getStatus || (() => ({ mmActive: false, liqActive: false, pwActive: false }));
   const getFairMid = deps.getFairMid || (() => null);
+  const getBalances = deps.getBalances || (async () => null);
 
   const startedAt = Date.now();
 
@@ -81,6 +96,17 @@ function createAlerts(deps) {
     lastLiqCycleTs: null,
     lastTradeTs: null,
     walletShareQuote: null,
+    ordersSeenTs: null, // Last liq cycle with at least one order open
+  };
+
+  // Wallet alerts
+  const wallet = {
+    lastCheckTs: 0,
+    isCheckInProgress: false,
+    samples: [], // { ts, quoteShare } within the fast-move window
+    lastFastMoveTs: 0,
+    emptySide: null, // 'buy' | 'sell': the side with no liq orders
+    emptySideCycles: 0,
   };
 
   /**
@@ -171,6 +197,155 @@ function createAlerts(deps) {
     }
   }
 
+  const round1 = (value) => Math.round(value * 10) / 10;
+
+  /**
+   * Evaluates side_empty after a liq cycle: one side has no liq orders for N consecutive cycles
+   * @param {number} bidsOpen
+   * @param {number} asksOpen
+   */
+  function evaluateSideEmpty(bidsOpen, asksOpen) {
+    if (bidsOpen > 0 && asksOpen > 0) {
+      wallet.emptySide = null;
+      wallet.emptySideCycles = 0;
+      clear('side_empty', { bidsOpen, asksOpen });
+      return;
+    }
+
+    if (bidsOpen === 0 && asksOpen === 0) {
+      // No orders at all is the no_orders case; don't count it as one-sided
+      wallet.emptySide = null;
+      wallet.emptySideCycles = 0;
+      return;
+    }
+
+    const emptySide = bidsOpen === 0 ? 'buy' : 'sell';
+
+    if (wallet.emptySide === emptySide) {
+      wallet.emptySideCycles += 1;
+    } else {
+      wallet.emptySide = emptySide;
+      wallet.emptySideCycles = 1;
+    }
+
+    if (wallet.emptySideCycles >= settings.emptySideCycles) {
+      raise('side_empty', { emptySide, cycles: wallet.emptySideCycles, bidsOpen, asksOpen });
+    }
+  }
+
+  /**
+   * Wallet level with hysteresis: serious holds until the weaker side is back to the warn level,
+   * warn holds until it's above the clear level
+   * @param {number} weakerShare Weaker side's share of wallet value, %
+   * @return {'serious' | 'warn' | null}
+   */
+  function walletLevel(weakerShare) {
+    const current = active.has('wallet_serious') ? 'serious' : active.has('wallet_warn') ? 'warn' : null;
+
+    if (weakerShare < settings.walletSeriousPct) return 'serious';
+    if (current === 'serious' && weakerShare < settings.walletWarnPct) return 'serious';
+    if (weakerShare < settings.walletWarnPct) return 'warn';
+    if (current && weakerShare < settings.walletClearPct) return 'warn';
+    return null;
+  }
+
+  /**
+   * Evaluates wallet_warn, wallet_serious and wallet_fast from one balance sample
+   * Share = value of each side / total, using free + locked balances and the fair mid
+   * @param {Object} sample
+   * @param {number} sample.base Base coin amount, free + locked
+   * @param {number} sample.quote Quote coin amount, free + locked
+   * @param {number|null} sample.fairMid
+   * @return {Object|undefined} Computed shares, undefined when skipped
+   */
+  function evaluateWallet({ base, quote, fairMid }) {
+    if (!(typeof fairMid === 'number' && isFinite(fairMid) && fairMid > 0)) return;
+    if (!isFinite(base) || !isFinite(quote) || base < 0 || quote < 0) return;
+
+    const baseValue = base * fairMid;
+    const total = baseValue + quote;
+    if (!(total > 0)) return;
+
+    const now = Date.now();
+    const quoteShare = quote / total * 100;
+    const baseShare = 100 - quoteShare;
+    const lowSide = quoteShare < baseShare ? 'quote' : 'base';
+    const weakerShare = Math.min(quoteShare, baseShare);
+
+    state.walletShareQuote = round1(quoteShare);
+
+    const data = {
+      baseShare: round1(baseShare),
+      quoteShare: round1(quoteShare),
+      lowSide, // 'quote': too much base coin, the bot will be unable to buy. 'base': unable to sell
+      baseAmount: base,
+      quoteAmount: quote,
+      fairMid,
+    };
+
+    // Levels are exclusive: one replaces the other without a clear message
+
+    const level = walletLevel(weakerShare);
+
+    if (level === 'serious') {
+      drop('wallet_warn');
+      raise('wallet_serious', data);
+    } else if (level === 'warn') {
+      drop('wallet_serious');
+      raise('wallet_warn', data);
+    } else {
+      clear('wallet_serious', data);
+      clear('wallet_warn', data);
+    }
+
+    // Fast move: compare with every sample in the window, take the biggest move
+
+    wallet.samples = wallet.samples.filter((s) => now - s.ts <= settings.walletFastWindowMs);
+
+    let from;
+    for (const s of wallet.samples) {
+      if (!from || Math.abs(quoteShare - s.quoteShare) > Math.abs(quoteShare - from.quoteShare)) {
+        from = s;
+      }
+    }
+
+    wallet.samples.push({ ts: now, quoteShare });
+
+    if (from && Math.abs(quoteShare - from.quoteShare) >= settings.walletFastPts) {
+      wallet.lastFastMoveTs = now;
+      raise('wallet_fast', {
+        fromQuoteShare: round1(from.quoteShare),
+        fromBaseShare: round1(100 - from.quoteShare),
+        toQuoteShare: round1(quoteShare),
+        toBaseShare: round1(baseShare),
+        movedPts: round1(Math.abs(quoteShare - from.quoteShare)),
+        windowMin: Math.round(settings.walletFastWindowMs / MINUTE),
+        lowSide,
+      });
+    }
+
+    return data;
+  }
+
+  /**
+   * Reads balances and evaluates the wallet alerts. Fire-and-forget from the liq cycle.
+   */
+  async function checkWallet() {
+    if (wallet.isCheckInProgress) return;
+    wallet.isCheckInProgress = true;
+
+    try {
+      const balances = await getBalances();
+      if (balances) {
+        evaluateWallet({ base: +balances.base, quote: +balances.quote, fairMid: getFairMid() });
+      }
+    } catch (e) {
+      log.warn(`Bot alerts: Unable to check the wallet balance: ${e}.`);
+    } finally {
+      wallet.isCheckInProgress = false;
+    }
+  }
+
   function heartbeatPayload() {
     const status = getStatus();
     const fairMid = getFairMid();
@@ -202,6 +377,12 @@ function createAlerts(deps) {
    */
   function tick() {
     try {
+      const now = Date.now();
+
+      if (active.has('wallet_fast') && now - wallet.lastFastMoveTs >= settings.walletFastWindowMs) {
+        clear('wallet_fast', {});
+      }
+
       sendReminders();
     } catch (e) {
       log.warn(`Bot alerts: Error in the evaluator tick: ${e}.`);
@@ -255,6 +436,36 @@ function createAlerts(deps) {
     send,
     tick,
     heartbeatPayload,
+    evaluateWallet,
+    checkWallet,
+
+    /**
+     * Records a finished liq cycle: open liq orders on each side (depth + ss)
+     * Evaluates side_empty and, at most once a minute, the wallet balance alerts
+     * @param {Object} cycle
+     * @param {number} cycle.bidsOpen
+     * @param {number} cycle.asksOpen
+     */
+    recordLiqCycle({ bidsOpen, asksOpen }) {
+      if (!settings.enabled) return;
+
+      const now = Date.now();
+
+      state.bidsOpen = bidsOpen;
+      state.asksOpen = asksOpen;
+      state.lastLiqCycleTs = now;
+
+      if (bidsOpen + asksOpen > 0) {
+        state.ordersSeenTs = now;
+      }
+
+      evaluateSideEmpty(bidsOpen, asksOpen);
+
+      if (now - wallet.lastCheckTs >= WALLET_CHECK_INTERVAL_MS) {
+        wallet.lastCheckTs = now;
+        checkWallet(); // Not awaited: never slow the liq loop
+      }
+    },
 
     /**
      * Records a trade (mm execution or fill) for the no_trades check
@@ -300,6 +511,19 @@ function getInstance() {
         const pw = require('../trade/mm_price_watcher');
         return typeof pw.getFairMid === 'function' ? pw.getFairMid() : null;
       },
+      async getBalances() {
+        const orderUtils = require('../trade/orderUtils');
+        const balances = await orderUtils.getBalancesCached(false, 'botAlerts');
+
+        if (!Array.isArray(balances)) return null;
+
+        const amount = (code) => {
+          const coin = balances.find((b) => b.code === code);
+          return coin ? (+coin.free || 0) + (+coin.freezed || 0) : 0;
+        };
+
+        return { base: amount(config.coin1), quote: amount(config.coin2) };
+      },
     });
   }
 
@@ -335,4 +559,5 @@ module.exports = {
   raise: safeHook('raise'),
   clear: safeHook('clear'),
   recordTrade: safeHook('recordTrade'),
+  recordLiqCycle: safeHook('recordLiqCycle'),
 };

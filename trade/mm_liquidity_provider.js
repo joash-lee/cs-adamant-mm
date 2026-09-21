@@ -150,6 +150,17 @@ module.exports = {
       liqInfoString += liqSsInfoString;
 
       log.log(liqInfoString);
+
+      // Alerts (observation only): open liq orders on each side, depth + ss
+      try {
+        const liqSsStats = utils.calculateOrderStats(liquidityOrders.filter((order) => order.subPurpose === 'ss'));
+        require('../helpers/botAlerts').recordLiqCycle({
+          bidsOpen: liquidityDepthStats.bidsCount + (liqSsStats?.bidsCount || 0),
+          asksOpen: liquidityDepthStats.asksCount + (liqSsStats?.asksCount || 0),
+        });
+      } catch (e) {
+        log.warn(`Liquidity: Unable to report the cycle to alerts: ${e}`);
+      }
     } catch (e) {
       log.error(`Error in updateLiquidity() of ${utils.getModuleName(module.id)} module: ${e}`);
     }
