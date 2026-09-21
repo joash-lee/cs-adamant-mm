@@ -19,6 +19,7 @@ const HOUR = 60 * MINUTE;
 const SEND_TIMEOUT_MS = 5000;
 const TICK_INTERVAL_MS = MINUTE;
 const WALLET_CHECK_INTERVAL_MS = MINUTE; // Balance reads for wallet alerts, at most once a minute
+const RATE_LIMIT_WINDOW_MS = 5 * MINUTE; // alert_429_count is per this window
 
 const ALERT_DEFAULTS = {
   alert_heartbeat_min: 10,
@@ -31,6 +32,8 @@ const ALERT_DEFAULTS = {
   alert_empty_side_cycles: 5,
   alert_no_orders_min: 10,
   alert_no_trades_min: 30,
+  alert_429_count: 30,
+  alert_trouble_clear_min: 30,
 };
 
 /**
@@ -60,6 +63,8 @@ function parseAlertConfig(config = {}) {
     emptySideCycles: num('alert_empty_side_cycles'),
     noOrdersMs: num('alert_no_orders_min') * MINUTE,
     noTradesMs: num('alert_no_trades_min') * MINUTE,
+    count429: num('alert_429_count'),
+    troubleClearMs: num('alert_trouble_clear_min') * MINUTE,
   };
 }
 
@@ -108,6 +113,12 @@ function createAlerts(deps) {
     mmActiveSince: null,
     liqActiveSince: null,
     lastMmActiveTs: null,
+  };
+
+  // exchange_trouble
+  const trouble = {
+    hits429: [], // Timestamps of HTTP 429 responses within the window
+    lastTroubleTs: 0,
   };
 
   // Wallet alerts
@@ -421,6 +432,24 @@ function createAlerts(deps) {
     }
   }
 
+  /**
+   * Raises exchange_trouble. It clears after alert_trouble_clear_min without trouble.
+   * @param {'rate_limit' | 'open_orders_failed' | 'false_empty'} reason
+   * @param {Object} [data] Numbers only
+   */
+  function reportExchangeTrouble(reason, data = {}) {
+    if (!settings.enabled) return;
+
+    trouble.lastTroubleTs = Date.now();
+    raise('exchange_trouble', { reason, ...data });
+  }
+
+  function prune429(now) {
+    while (trouble.hits429.length && now - trouble.hits429[0] > RATE_LIMIT_WINDOW_MS) {
+      trouble.hits429.shift();
+    }
+  }
+
   function heartbeatPayload() {
     const status = getStatus();
     const fairMid = getFairMid();
@@ -455,6 +484,11 @@ function createAlerts(deps) {
       const now = Date.now();
 
       evaluateActivity(getStatus());
+
+      prune429(now);
+      if (active.has('exchange_trouble') && now - trouble.lastTroubleTs >= settings.troubleClearMs) {
+        clear('exchange_trouble', {});
+      }
 
       if (active.has('wallet_fast') && now - wallet.lastFastMoveTs >= settings.walletFastWindowMs) {
         clear('wallet_fast', {});
@@ -517,6 +551,23 @@ function createAlerts(deps) {
     heartbeatPayload,
     evaluateWallet,
     checkWallet,
+    reportExchangeTrouble,
+
+    /**
+     * Records an HTTP 429 (rate limit) response from the exchange
+     * Raises exchange_trouble when there are alert_429_count of them within 5 minutes
+     */
+    record429() {
+      if (!settings.enabled) return;
+
+      const now = Date.now();
+      trouble.hits429.push(now);
+      prune429(now);
+
+      if (trouble.hits429.length >= settings.count429) {
+        reportExchangeTrouble('rate_limit', { count429: trouble.hits429.length, windowMin: RATE_LIMIT_WINDOW_MS / MINUTE });
+      }
+    },
 
     /**
      * Records a finished liq cycle: open liq orders on each side (depth + ss)
@@ -640,4 +691,6 @@ module.exports = {
   clear: safeHook('clear'),
   recordTrade: safeHook('recordTrade'),
   recordLiqCycle: safeHook('recordLiqCycle'),
+  record429: safeHook('record429'),
+  reportExchangeTrouble: safeHook('reportExchangeTrouble'),
 };

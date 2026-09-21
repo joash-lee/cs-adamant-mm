@@ -703,6 +703,8 @@ module.exports = {
         logMessage = `Unable to receive ${pair} open orders${onWhichAccount} from exchange to close Unknown orders. It seems API request failed. Try again later.`;
         log.warn(`Order collector: ${logMessage}`);
 
+        require('../helpers/botAlerts').reportExchangeTrouble('open_orders_failed'); // Alerts; never throws
+
         return {
           logMessage,
         };

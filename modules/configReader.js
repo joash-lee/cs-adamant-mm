@@ -256,6 +256,46 @@ const fields = {
     type: Number,
     isRequired: false,
   },
+  alert_wallet_warn_pct: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_wallet_serious_pct: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_wallet_clear_pct: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_wallet_fast_move_pts: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_wallet_fast_window_min: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_empty_side_cycles: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_no_orders_min: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_no_trades_min: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_429_count: {
+    type: Number,
+    isRequired: false,
+  },
+  alert_trouble_clear_min: {
+    type: Number,
+    isRequired: false,
+  },
   // Fill log (helpers/fillLog.js), on unless false. No default here: a Boolean default would override an explicit false
   fill_log_enabled: {
     type: Boolean,

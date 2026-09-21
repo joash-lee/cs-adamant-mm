@@ -656,6 +656,8 @@ module.exports = {
           log.warn(`orderUtils: ${falseResultString}. Leaving ${samePurpose}dbOrders as is.`);
           notify(`${config.notifyName}: ${falseResultString}. ${checkLogsString}`, 'warn', undefined, true); // Priority notification
 
+          require('../helpers/botAlerts').reportExchangeTrouble('false_empty'); // Alerts; never throws
+
           return dbOrders;
         }
       }

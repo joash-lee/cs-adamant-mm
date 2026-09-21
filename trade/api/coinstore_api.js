@@ -68,6 +68,14 @@ module.exports = function() {
         } else {
           const errorDescription = httpErrorCodeDescriptions[httpCode] ?? 'Unknown error';
 
+          if (httpCode === 429) {
+            try {
+              require('../../helpers/botAlerts').record429(); // Alerts: counts rate-limit hits
+            } catch {
+              // Alerts must never affect request handling
+            }
+          }
+
           log.warn(`Request to ${url} with data ${reqParameters} failed. ${errorDescription}, details: ${errorMessage}. Rejecting…`);
 
           reject(errorMessage);

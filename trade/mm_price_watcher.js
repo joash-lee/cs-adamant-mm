@@ -1099,6 +1099,14 @@ async function setPriceRange() {
       }
 
       lastActivePwSource = rangeResult.activeSourceLabel;
+
+      // Alerts (observation only): on the backup source while the primary is unavailable
+      const botAlerts = require('../helpers/botAlerts');
+      if (rangeResult.isFallback) {
+        botAlerts.raise('backup_price', {});
+      } else {
+        botAlerts.clear('backup_price', {});
+      }
       lastOkxAuthMode = rangeResult.targetExchange?.toLowerCase() === 'okx' ? rangeResult.okxAuthMode : null;
       lastPwCoefficientApplied = rangeResult.appliedCoefficient;
 
