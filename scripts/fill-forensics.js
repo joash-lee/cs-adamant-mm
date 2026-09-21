@@ -121,9 +121,14 @@ const pendingMarkouts = []; // fills waiting for the fair price MARKOUT_MS later
 const weeks = new Map();
 const days = new Map();
 const daySnap = new Map(); // day -> { cumBase, cumQuote, fair } at the last event of that day
+// Lookup tables are bounded: related lines sit close together in the log, so old entries can be dropped.
+// Keys/values are copied (own()) so they don't pin the log chunk they were sliced from in memory.
 const cancelReplies = new Map(); // order id -> exchange's reply to the last cancel attempt
-const countedVanished = new Set(); // order ids already counted as vanished-filled
+const countedVanished = new Map(); // order ids already counted as vanished-filled (used as an ordered set)
 const mmRemainders = new Map(); // mm taker order id -> unfilled remainder awaiting its cancel result
+const MAX_LOOKUP = 50000;
+const MAX_PENDING_MARKOUTS = 200000;
+let csvBackpressure = false;
 let mmPending = null; // last executeInOrderBook trade waiting for its status line
 let mmLastPartial = null; // last partly/unfilled taker trade waiting for its Clearing line
 const unconfirmed = {}; // source -> { buyBase, buyQuote, sellBase, sellQuote, count }
@@ -136,6 +141,15 @@ let fillCount = 0;
 
 const csv = opts.csv ? fs.createWriteStream(opts.csv) : null;
 if (csv) csv.write('time,source,side,price,amount,quote,fair,edge,cumCoin,cumUsdt\n');
+
+function own(str) {
+  return Buffer.from(str, 'utf8').toString('utf8');
+}
+
+function boundedSet(map, key, value) {
+  map.set(key, value);
+  if (map.size > MAX_LOOKUP) map.delete(map.keys().next().value);
+}
 
 function weekKey(day) {
   const d = new Date(day + 'T00:00:00Z');
@@ -250,10 +264,11 @@ function addFill(day, time, ts, source, side, amount, price) {
     }
   }
 
-  pendingMarkouts.push({ ts, side, price, amount, statsRefs });
+  pendingMarkouts.push({ ts, side: side === 'buy' ? 'buy' : 'sell', price, amount, statsRefs });
+  if (pendingMarkouts.length > MAX_PENDING_MARKOUTS) pendingMarkouts.shift();
 
   if (csv) {
-    csv.write(`${day} ${time},${source},${side},${price},${amount},${(amount * price).toFixed(4)},${fairNow ?? ''},${edge === null ? '' : edge.toFixed(4)},${cumBase.toFixed(6)},${cumQuote.toFixed(4)}\n`);
+    if (!csv.write(`${day} ${time},${source},${side},${price},${amount},${(amount * price).toFixed(4)},${fairNow ?? ''},${edge === null ? '' : edge.toFixed(4)},${cumBase.toFixed(6)},${cumQuote.toFixed(4)}\n`)) csvBackpressure = true;
   }
 }
 
@@ -295,13 +310,13 @@ function handleLine(line) {
 
   if (msg.startsWith('Unable to cancel order ')) {
     const r = RE_CANCEL_REPLY.exec(msg);
-    if (r) cancelReplies.set(r[1], r[2].trim());
+    if (r) boundedSet(cancelReplies, own(r[1]), own(r[2].trim()));
     return;
   }
 
   if (msg.startsWith('Order ') && msg.includes('is already cancelled')) {
     const r = RE_ALREADY_CANCELLED.exec(msg);
-    if (r) cancelReplies.set(r[1], 'already cancelled');
+    if (r) boundedSet(cancelReplies, own(r[1]), 'already cancelled');
     return;
   }
 
@@ -317,7 +332,7 @@ function handleLine(line) {
       tally('vanished: duplicate line, skipped');
       return;
     }
-    countedVanished.add(id);
+    boundedSet(countedVanished, own(id), true);
 
     const remainder = mmRemainders.get(id);
     mmRemainders.delete(id);
@@ -355,9 +370,9 @@ function handleLine(line) {
   if (msg.includes('Clearing mm-order') && mmLastPartial) {
     const c = RE_MM_CLEAR.exec(msg);
     if (c) {
-      mmRemainders.set(c[1], mmLastPartial);
+      const { ts: rTs, side: rSide, amount: rAmount, price: rPrice } = mmLastPartial;
+      boundedSet(mmRemainders, own(c[1]), { ts: rTs, side: rSide === 'buy' ? 'buy' : 'sell', amount: rAmount, price: rPrice });
       mmLastPartial = null;
-      if (mmRemainders.size > 10000) mmRemainders.delete(mmRemainders.keys().next().value);
     }
     return;
   }
@@ -396,7 +411,18 @@ function handleLine(line) {
 
 async function readFile(file) {
   const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) handleLine(line);
+  let lines = 0;
+  for await (const line of rl) {
+    handleLine(line);
+    if (csvBackpressure) {
+      csvBackpressure = false;
+      await new Promise((resolve) => csv.once('drain', resolve));
+    }
+    if (++lines % 2000000 === 0) {
+      const heapMb = Math.round(process.memoryUsage().heapUsed / 1048576);
+      process.stderr.write(`  ${(lines / 1e6).toFixed(0)}M lines, ${fmt(fillCount)} fills, heap ${heapMb} MB\n`);
+    }
+  }
 }
 
 // ── Formatting ──
