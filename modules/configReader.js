@@ -256,6 +256,11 @@ const fields = {
     type: Number,
     isRequired: false,
   },
+  // Fill log (helpers/fillLog.js), on unless false. No default here: a Boolean default would override an explicit false
+  fill_log_enabled: {
+    type: Boolean,
+    isRequired: false,
+  },
 };
 
 try {

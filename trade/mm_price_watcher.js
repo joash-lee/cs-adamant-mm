@@ -128,6 +128,12 @@ let lastOkxAuthMode = null;
 let lastPwCoefficientApplied = null;
 let lastFallbackNotifyTimestamp = 0;
 
+// Fair mid = centre of the post-coefficient, pre-deviation range of the last successful source read (primary or fallback).
+// Used by alerts and the fill log only; never by pricing
+let lastFairMid = null;
+let lastFairMidTimestamp = 0;
+const FAIR_MID_MAX_AGE_MS = 10 * 60 * 1000;
+
 const FALLBACK_NOTIFY_INTERVAL_MS = 60 * 60 * 1000;
 
 const PRICE_RANDOMIZATION_PERCENT = 0.2; // For any price source, randomize low and high bounds ±0.2%
@@ -322,6 +328,20 @@ module.exports = {
   },
 
   computeRangeFromSource,
+
+  /**
+   * Fair mid price from the last successful PW source read: (preDeviationL + preDeviationH) / 2.
+   * Excludes deviation, randomisation and support-price overrides. For alerts and the fill log only.
+   * @returns {number|null} null if unknown or older than 10 minutes
+   */
+  getFairMid() {
+    if (!lastFairMid || Date.now() - lastFairMidTimestamp > FAIR_MID_MAX_AGE_MS) {
+      return null;
+    }
+
+    return lastFairMid;
+  },
+
 
   /**
    * Returns log string for other modules
@@ -1019,6 +1039,7 @@ async function computeRangeFromSource(sourceString, isFallback = false) {
     targetExchange,
     okxAuthMode,
     isFallback,
+    fairMid: (preDeviationL + preDeviationH) / 2,
   };
 }
 
@@ -1071,6 +1092,11 @@ async function setPriceRange() {
 
       l = rangeResult.l;
       h = rangeResult.h;
+
+      if (isFinite(rangeResult.fairMid) && rangeResult.fairMid > 0) {
+        lastFairMid = rangeResult.fairMid;
+        lastFairMidTimestamp = Date.now();
+      }
 
       lastActivePwSource = rangeResult.activeSourceLabel;
       lastOkxAuthMode = rangeResult.targetExchange?.toLowerCase() === 'okx' ? rangeResult.okxAuthMode : null;

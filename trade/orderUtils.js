@@ -850,6 +850,28 @@ module.exports = {
         }
       }
 
+      // Fill log (observation only). mm-orders are logged by mm_trader, so skip them here not to double count
+
+      try {
+        const fillLog = require('../helpers/fillLog');
+
+        for (const purpose in fills) {
+          if (purpose === 'all' || purpose === 'mm') continue;
+
+          for (const order of [...fills[purpose].partlyFilledOrders, ...fills[purpose].filledOrders]) {
+            fillLog.record({
+              source: purpose,
+              side: order.type,
+              price: order.price,
+              amount: order.coin1AmountFilled,
+              quote: order.coin2AmountFilled,
+            });
+          }
+        }
+      } catch (e) {
+        log.warn(`orderUtils: Unable to write the fill log: ${e}`);
+      }
+
       // Log results
 
       const formattedPair = /** @type {ParsedMarket} */ (this.parseMarket(pair));

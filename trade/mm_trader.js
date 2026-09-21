@@ -305,6 +305,8 @@ module.exports = {
 
             await order.save();
 
+            recordMmFill(order, type, 'mm-self');
+
             // Cancelling maker and taker orders, if they are not filled/cancelled
 
             if ([undefined, 'unknown', 'new', 'part_filled'].includes(order1Status)) {
@@ -436,6 +438,8 @@ module.exports = {
 
           await order.save();
 
+          recordMmFill(order, type, 'mm-taker');
+
           // Cancelling mm-order, if it's not filled/cancelled
 
           if ([undefined, 'unknown', 'new', 'part_filled'].includes(order1Status)) {
@@ -453,6 +457,26 @@ module.exports = {
     }
   },
 };
+
+/**
+ * Writes an executed mm-order to the fill log (observation only)
+ * When the filled amount is unknown but the order is marked executed, it's assumed fully filled, as mm_trader does
+ * @param {Object} order mm-order from ordersDb
+ * @param {'buy' | 'sell'} side Target (taker) side of the trade
+ * @param {'mm-self' | 'mm-taker'} source mm-self for executeInSpread self-trades, mm-taker for executeInOrderBook
+ */
+function recordMmFill(order, side, source) {
+  try {
+    const amount = order.coin1AmountFilled ?? (order.isExecuted ? order.coin1Amount : 0);
+    const quote = order.coin2AmountFilled ?? amount * order.price;
+
+    if (amount > 0) {
+      require('../helpers/fillLog').record({ source, side, price: order.price, amount, quote });
+    }
+  } catch (e) {
+    log.warn(`Market-making: Unable to write the fill log: ${e}`);
+  }
+}
 
 /**
  * Determines if to 'buy' or 'sell'
