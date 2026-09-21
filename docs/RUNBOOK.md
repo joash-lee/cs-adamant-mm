@@ -89,7 +89,7 @@ Adamant:
 /enable ob 4 20%
 /amount 1-4
 /interval 30-120 sec
-/buypercent 0.5
+/buypercent 50
 /start mm optimal
 /params
 ```

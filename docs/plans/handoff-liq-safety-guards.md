@@ -126,7 +126,7 @@ Priority notify (rate-limited 10 min per key, all via `helpers/notify.js`) when:
 ## 6. Live operating params (context only — do not encode into code)
 
 `/start mm spread` · `/enable pw JITOSOL/USDT@OKX 0.5% smart prevent -y` · `/enable liq 1.5% 15 JITOSOL 2150 USDT ss middle` ·
-`/amount 0.5-1` · `/interval 45-120 sec` (later 90-180) · `/buypercent 0.5` · `/disable ob`.
+`/amount 0.5-1` · `/interval 45-120 sec` (later 90-180) · `/buypercent 50` (value is a percent: 0.5 would mean 0.5% buys) · `/disable ob`.
 Kill switch: OKX moves >2% in 10 min, or liq shows 0 bids/asks → `/stop mm` then `/clear JITOSOL/USDT all`.
 
 ## 7. Decision record / rejected options (also post as a Linear decision comment when tickets exist)
