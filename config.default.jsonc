@@ -128,6 +128,37 @@
   **/
   "pw_source_coefficient": 0,
 
+  /**
+    Alerts to Telegram via an n8n webhook (helpers/botAlerts.js). Optional.
+    Missing alert_webhook_url = the whole alert feature is off: no timers, no requests.
+    The bot sends event keys + numbers; n8n writes the message text and detects a dead bot (no heartbeat).
+    Keep the secret only here and in the n8n header-auth credential. See docs/RUNBOOK.md, "Alerts".
+  **/
+  // "alert_webhook_url": "https://n8n.example.com/webhook/tradebot-alerts",
+  // "alert_webhook_secret": "LONG-RANDOM-STRING",
+
+  /** Optional alert thresholds; the values shown are the defaults **/
+  // "alert_heartbeat_min": 10,          // heartbeat interval; n8n raises 'offline' after 20 min, keep this ≤ half of it
+  // "alert_wallet_warn_pct": 30,        // weaker side's share of wallet value (free + locked, at fair price) below this → warning
+  // "alert_wallet_serious_pct": 15,     // … below this → serious
+  // "alert_wallet_clear_pct": 35,       // … back above this → all clear (the gap stops flip-flopping)
+  // "alert_wallet_fast_move_pts": 15,   // wallet split moved this many points …
+  // "alert_wallet_fast_window_min": 60, // … within this many minutes → fast-move alert
+  // "alert_empty_side_cycles": 5,       // liq cycles in a row with no buy (or no sell) orders → alert
+  // "alert_no_orders_min": 10,          // MM + liq on, but no liq orders (or no liq cycle) for this long → alert
+  // "alert_no_trades_min": 30,          // MM on, but no trade for this long → alert
+  // "alert_429_count": 30,              // Coinstore HTTP 429s within 5 minutes → exchange trouble
+  // "alert_trouble_clear_min": 30,      // exchange trouble clears after this long without trouble
+  // "alert_reminder_hours": 6,          // reminder while an alert stays raised
+  // "alert_daily_utc_hour": 1,          // daily report hour, UTC (1 = 09:00 SGT)
+  // "alert_bad_fills_pct": 1,           // daily report warns when trades averaged worse than −this % vs fair
+
+  /**
+    Fill log: one line per fill in logs/fills-YYYY-MM-DD.jsonl (UTC day), priced against the fair price.
+    Local file only, no API calls. Feeds the daily report. On unless set to false.
+  **/
+  "fill_log_enabled": true,
+
   /** Override project name for notifications. Letters, digits, - and ~ only. By default, it's derived from a repository name, TradeBot-me. **/
   "project_name": "",
 

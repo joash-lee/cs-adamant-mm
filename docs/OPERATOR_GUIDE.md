@@ -187,13 +187,59 @@ pm2 logs tradebot --lines 80 | grep -E 'Active PW source|Falling back|cross-base
 
 ---
 
+## Alerts — what the Telegram messages mean
+
+The bot lost most of its USDT between June and September 2026 and nobody noticed for weeks. Alerts make that
+loud within minutes. They **don't stop a loss by themselves**: a person has to act on them.
+
+How it works: the bot checks itself and sends short events to n8n (on the same VPS); n8n writes the message
+and sends it to the dedicated Telegram chat. n8n also notices when the bot goes silent. If the whole VPS is down,
+both are silent — the daily 09:00 report not arriving is the tell.
+
+Each message says **what happened → why it matters → Do:**. The full list with thresholds is in
+[RUNBOOK.md → Alerts](./RUNBOOK.md#alerts-telegram-via-n8n). In plain words:
+
+- **Wallet one-sided (⚠️ / 🔴):** the bot's money has drifted to one coin. Too much JITOSOL means it will soon be
+  unable to buy; too much USDT means unable to sell. 🔴 = act: add the missing coin or pause.
+- **Wallet moved fast (⚡):** the split changed a lot within an hour. Normal trading drifts slowly; a fast move
+  often means someone is trading against the bot's orders. Look now.
+- **Only selling / only buying (🛑):** one side of the book is empty. This is what the June–September loss looked
+  like at the end (12.70 USDT left). Pause now.
+- **Offline / no orders / no trades:** the bot crashed, is running with nothing on the market, or has stopped
+  trading. Offline is the dangerous one: the orders are still on Coinstore with nobody managing them.
+- **Lost main price reference:** OKX is unreachable and the bot is pricing from the backup estimate.
+- **Coinstore not responding:** the bot may be unable to update or cancel its orders.
+- **Daily report:** trades against outsiders in the last 24 h, how they compared with the fair price on average,
+  the wallet, and how many alerts fired.
+
+**"Pause the bot"** = `/stop mm`, then `/clear JITOSOL/USDT all`.
+
+**False alarms to expect:** deposits and withdrawals and big price moves change the wallet split, so they can
+trigger wallet alerts. That's the alert working, not a fault.
+
+### MM policy: use `spread`
+
+With `optimal` and liq both on, about 80% of MM trades went **into the real order book** (taker trades that cross
+the spread and pay for it) instead of self-trades inside the spread. `spread` keeps MM volume inside the spread.
+Start with `/start mm spread …`.
+
+### Reading the fill log
+
+`logs/fills-YYYY-MM-DD.jsonl` has one line per trade. The number to watch is **`vsFairPct`**: how much better (+)
+or worse (−) than the fair price (OKX) the bot traded. A few −0.2% lines are normal. A day averaging worse than
+**−1%** means the bot's orders are being picked off (someone trades against them just before the price moves):
+the daily report says so and suggests pausing. `mm-self` lines are self-trades (volume only) and are left out of
+that average.
+
+---
+
 ## Restart & stop
 
 **`pm2 restart tradebot`:** Safe for config changes and cache refresh. Orders stay open on Coinstore. ~5–30 s gap with no updates.
 
 **`/stop mm`:** Stops trading logic without killing the process.
 
-After restart: `/params`, `/balances`, grep `Active PW source`.
+After restart: `/params`, `/balances`, grep `Active PW source`, and `Bot alerts: Started` if alerts are configured.
 
 ---
 

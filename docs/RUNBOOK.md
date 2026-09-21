@@ -107,6 +107,7 @@ Adamant:
 | Liq spread | **0.5%** → 1% later | Start conservative |
 | Liq caps | **6 JITOSOL** / **600 USDT** | Raise after validation |
 | MM interval | **30–120 s** initially | Widen until OKX anchor trusted |
+| MM policy | **`spread`** (`/start mm spread …`) | `optimal` + liq sent ~80% of MM trades into the real book (taker trades at a loss); see Alerts |
 | OB | **4** orders or **disabled** | Reduces 429 risk |
 
 **Old values (do not use as default anymore):** `SOL/USDT@Coinstore` as primary PW, 2.5% deviation, 2% / 12 / 1200 liq — only if you deliberately revert.
@@ -210,6 +211,78 @@ Edit on VPS, then `pm2 restart tradebot`:
 | `1401` | Coinstore IP whitelist |
 | `Applied cross-base coefficient` **while** `/params` shows `@OKX` and OKX is up | Misconfiguration — investigate |
 | Band tracks Coinstore JITOSOL book (~1% above OKX) | Old anchor or PW disabled |
+
+---
+
+## Alerts (Telegram via n8n)
+
+The bot watches itself and posts short events to an n8n webhook on the same VPS; n8n writes the Telegram
+message and raises **🛑 offline** when the bot stops checking in. Nothing here changes how the bot trades.
+Existing Adamant notifications carry on unchanged.
+
+**"Pause the bot"** in any alert means, in Adamant:
+
+```
+/stop mm
+/clear JITOSOL/USDT all
+```
+
+(`/stop mm` alone leaves orders on the book; a restart leaves them too.)
+
+### What you can get
+
+| Message | When (defaults) | Do |
+|---|---|---|
+| ⚠️ Wallet getting one-sided | weaker side < **30%** of wallet value | Keep an eye on it |
+| 🔴 Wallet very one-sided | weaker side < **15%** | Add the missing coin or pause the bot |
+| ⚡ Wallet moved fast | split moved ≥ **15 points** within **60 min** | Check now — someone may be trading against the bot |
+| 🛑 Bot is only selling / only buying | liq has no buy (or sell) orders for **5** cycles | Pause the bot now |
+| 🛑 Bot hasn't checked in | no heartbeat for **20 min** (sent by n8n) | Restart the bot, or cancel orders on Coinstore |
+| 🛑 No orders on the market | MM + liq on, no liq orders (or liq stuck) for **10 min** | Check / restart the bot |
+| ⚠️ No trades | MM on, no trade for **30 min** | Check the price reference |
+| ℹ️ Bot paused / ▶️ resumed | `mm_isActive` off / on | — |
+| ⚠️ Lost main price reference | PW is on `pw_fallback_source` | Usually fixes itself; over 1 h → pause |
+| ⚠️ Coinstore not responding | ≥ **30** HTTP 429 in 5 min, open orders unreadable, or a false-empty order list | Repeats within an hour → pause, check open orders |
+| 📊 Daily | **01:00 UTC = 09:00 SGT** | Read it; a "worse than market price" line means consider pausing |
+
+Every alert has a ✅ all-clear message. Raised alerts repeat every **6 h** until they clear.
+Wallet share = value of each side (free + locked, at the fair price) / total. Warnings clear only above **35%**,
+so a wallet hovering at 31–34% doesn't flip-flop.
+
+**Known false alarms:** deposits and withdrawals shift the wallet split (can fire ⚡ fast-move or a level alert);
+so do big price moves. A restart forgets alert state and re-checks from scratch.
+
+### Config (`config.jsonc`, then `pm2 restart tradebot`)
+
+```jsonc
+"alert_webhook_url": "https://n8n.srv935443.hstgr.cloud/webhook/tradebot-alerts",
+"alert_webhook_secret": "…"   // same value as the n8n header-auth credential
+```
+
+Missing `alert_webhook_url` = alerts fully off. Every threshold above is an optional `alert_*` key;
+defaults and meanings are in `config.default.jsonc`. After a restart, `pm2 logs tradebot --lines 80` should show
+`Bot alerts: Started`, and Telegram shows ℹ️ *Bot paused* within a minute if MM is stopped.
+
+**Test every message** (from the laptop; URL and secret from your shell, never pasted anywhere):
+
+```bash
+ALERT_WEBHOOK_URL=… ALERT_WEBHOOK_SECRET=… node scripts/alert-smoke.js
+```
+
+`--dry-run` prints the payloads without sending. The offline alert is tested by `pm2 stop tradebot` for ~20 min
+(clear orders first), then `pm2 start tradebot` → ✅ back online.
+
+### Fill log
+
+`logs/fills-YYYY-MM-DD.jsonl` (UTC day), one line per fill:
+`{ts, source, side, price, amount, quote, fair, vsFairPct}`. `source`: `liq`, `mm-taker` (MM trade into the real book),
+`mm-self` (self-trade, volume only). `vsFairPct` = how much better (+) or worse (−) than the fair price the bot traded.
+Always on; set `"fill_log_enabled": false` to stop it. For old periods without a fill log, use
+`node scripts/fill-forensics.js logs/*.log`.
+
+```bash
+tail -5 logs/fills-$(date -u +%F).jsonl
+```
 
 ---
 
